@@ -6,14 +6,15 @@ import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QMessageBox, QGridLayout, QSizePolicy,
-    QShortcut, QSystemTrayIcon, QMenu, QAction, QCheckBox,
+    QShortcut, QSystemTrayIcon, QMenu, QAction, QCheckBox, QDialog,
 )
 from PyQt5.QtGui import QFont, QPalette, QColor, QIcon, QIntValidator, QCursor, QKeySequence
-from PyQt5.QtCore import Qt, QSettings
+from PyQt5.QtCore import Qt, QSettings, QTimer
 from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkReply
 
 from styles import (
-    BG_COLOR, TEXT_COLOR, MUTED, PRIMARY, DANGER, INFO,
+    BG_COLOR, TEXT_COLOR, MUTED, PRIMARY, PRIMARY_HOVER, PRIMARY_PRESSED,
+    DANGER, INFO, INFO_HOVER, INFO_PRESSED,
     SUCCESS_GREEN, WARNING_ORANGE, ERROR_RED, LABEL_COLOR,
     INPUT_STYLE, action_btn_style,
 )
@@ -23,6 +24,7 @@ from proxy_core import (
     get_current_proxy, enable_proxy_registry, disable_proxy_registry,
     refresh_system, parse_proxy_server,
     is_private_ip, make_geo_request, parse_geo_response,
+    get_bypass_local,
 )
 
 LABEL_W = 64
@@ -45,14 +47,40 @@ class ProxyTool(QMainWindow):
         self._test_check_count = 0
         self._test_timer = None
 
+        # 存储检测结果，用于托盘悬停提示
+        self._proxy_geo_data = {}
+        self._tcp_ms = None
+        self._egress_ms = None
+        self._egress_geo_data = {}
+        self._proxy_ip = ""
+        self._proxy_port = ""
+
         self.nm = QNetworkAccessManager(self)
         self.nm.finished.connect(self.on_geo_finished)
+
+        # 托盘悬停时实时更新延迟（每 30 秒刷新）
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(30000)
+        self._refresh_timer.timeout.connect(self._on_periodic_refresh)
 
         self.setup_ui()
         self.setup_tray(icon_path)
         self.load_settings()
         self.update_status()
         self._center_on_screen()
+
+        # 启动时如果已填写 IP 和端口，自动测试连接
+        if not self._proxy_enabled:
+            ip = self.ip_entry.text().strip()
+            port = self.port_entry.text().strip()
+            if ip and port:
+                try:
+                    port_int = int(port)
+                    if 1 <= port_int <= 65535:
+                        self.lookup_geo(ip)
+                        self.test_latency(ip, port_int)
+                except ValueError:
+                    pass
 
     @staticmethod
     def _resource_path(relative_path):
@@ -147,6 +175,13 @@ class ProxyTool(QMainWindow):
         self.tray_cb.setChecked(True)
         opt_row.addWidget(self.tray_cb)
 
+        self.bypass_cb = QCheckBox("绕过本地地址")
+        self.bypass_cb.setFont(QFont("Microsoft YaHei", 9))
+        self.bypass_cb.setStyleSheet(f"color: {LABEL_COLOR};")
+        self.bypass_cb.setChecked(True)
+        self.bypass_cb.setToolTip("启用代理时绕过局域网和本地地址，不经过代理")
+        opt_row.addWidget(self.bypass_cb)
+
         opt_row.addStretch()
         grid.addLayout(opt_row, 2, 0, 1, 3)
 
@@ -223,7 +258,7 @@ class ProxyTool(QMainWindow):
         else:
             self.tray_icon.setIcon(self.style().standardIcon(
                 self.style().SP_ComputerIcon))
-        self.tray_icon.setToolTip("代理切换工具 - 已禁用")
+        self.tray_icon.setToolTip("已禁用代理")
 
         tray_menu = QMenu()
 
@@ -236,6 +271,16 @@ class ProxyTool(QMainWindow):
         show_action = QAction("显示主窗口", tray_menu)
         show_action.triggered.connect(self._show_window)
         tray_menu.addAction(show_action)
+
+        self.copy_info_action = QAction("复制代理信息", tray_menu)
+        self.copy_info_action.triggered.connect(self._copy_proxy_info)
+        tray_menu.addAction(self.copy_info_action)
+
+        tray_menu.addSeparator()
+
+        about_action = QAction("关于", tray_menu)
+        about_action.triggered.connect(self._show_about)
+        tray_menu.addAction(about_action)
 
         quit_action = QAction("退出", tray_menu)
         quit_action.triggered.connect(self._quit_app)
@@ -253,6 +298,10 @@ class ProxyTool(QMainWindow):
         self.showNormal()
         self.activateWindow()
         self.raise_()
+
+    def _show_about(self):
+        """托盘菜单 → 关于：直接弹出 ReadMe 弹窗（不显示主窗口）"""
+        self.show_info_dialog(None)
 
     def _quit_app(self):
         self.tray_icon.hide()
@@ -284,6 +333,12 @@ class ProxyTool(QMainWindow):
             if port:
                 self.port_entry.setText(port)
             self.tray_cb.setChecked(True)
+            # 加载绕过本地地址设置，默认从注册表读取，否则勾选
+            bypass = s.value("bypass_local")
+            if bypass is not None:
+                self.bypass_cb.setChecked(bypass.lower() == "true" if isinstance(bypass, str) else bool(bypass))
+            else:
+                self.bypass_cb.setChecked(get_bypass_local())
         except (TypeError, OSError):
             pass
 
@@ -293,6 +348,7 @@ class ProxyTool(QMainWindow):
             s.setValue("proxy_ip", self.ip_entry.text().strip())
             s.setValue("proxy_port", self.port_entry.text().strip())
             s.setValue("close_to_tray", self.tray_cb.isChecked())
+            s.setValue("bypass_local", self.bypass_cb.isChecked())
         except (TypeError, OSError):
             pass
 
@@ -306,26 +362,242 @@ class ProxyTool(QMainWindow):
 
         if self._proxy_enabled:
             ip, port, _ = parse_proxy_server(server)
-            text = f"✓ 已启用: {ip}:{port}"
+            self._proxy_ip = ip
+            self._proxy_port = port
+            text = f"✓ 已启用代理: {ip}:{port}"
             style = f"color: {PRIMARY}; font-weight: bold;"
 
             self.toggle_btn.setText("取消代理")
             self.toggle_btn.setStyleSheet(
                 action_btn_style(DANGER, "#d0b0b0", "#b89090"))
             self.tray_toggle_action.setText("禁用代理")
-            self.tray_icon.setToolTip(f"代理切换工具 - 已启用: {ip}:{port}")
+
+            # 启动时自动检测归属地和延迟
+            self.lookup_geo(ip)
+            self.test_latency(ip, int(port))
+
+            # 启动定时刷新延迟
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start()
         else:
-            text = "✗ 已禁用"
+            self._proxy_ip = ""
+            self._proxy_port = ""
+            text = "✗ 已禁用代理"
             style = f"color: {DANGER}; font-weight: bold;"
 
             self.toggle_btn.setText("设置代理")
             self.toggle_btn.setStyleSheet(
                 action_btn_style(PRIMARY, "#99acbd", "#7d90a3"))
             self.tray_toggle_action.setText("启用代理")
-            self.tray_icon.setToolTip("代理切换工具 - 已禁用")
+
+            # 清除缓存的检测结果
+            self._proxy_geo_data = {}
+            self._tcp_ms = None
+            self._egress_ms = None
+            self._egress_geo_data = {}
+
+            # 停止定时刷新
+            if self._refresh_timer.isActive():
+                self._refresh_timer.stop()
 
         self.status_label.setText(text)
         self.status_label.setStyleSheet(style)
+        self._refresh_tray_tooltip()
+
+    def _refresh_tray_tooltip(self):
+        """更新托盘悬停提示 — 每行尽量短，避免 Windows 系统 tooltip 折行"""
+        if not self._proxy_enabled:
+            self.tray_icon.setToolTip("已禁用代理")
+            return
+
+        lines = ["已启用代理"]
+        lines.append(f"IP:{self._proxy_ip}")
+        lines.append(f"端口:{self._proxy_port}")
+
+        # 代理归属
+        if self._proxy_geo_data:
+            country = self._proxy_geo_data.get("country", "")
+            city = self._proxy_geo_data.get("city", "")
+            if country or city:
+                lines.append(f"代理:{' '.join(p for p in [country, city] if p)}")
+            else:
+                lines.append("代理:---")
+        else:
+            lines.append("代理:---")
+
+        # 代理延迟
+        if self._tcp_ms is not None:
+            if self._tcp_ms > 0:
+                lines.append(f"延迟:{self._tcp_ms:.0f}ms")
+            else:
+                err_map = {-1: "超时", -2: "拒绝", -3: "不可达", -4: "失败"}
+                lines.append(f"延迟:{err_map.get(self._tcp_ms, '失败')}")
+        else:
+            lines.append("延迟:---")
+
+        # 出口归属
+        if self._egress_geo_data:
+            country = self._egress_geo_data.get("country", "")
+            city = self._egress_geo_data.get("city", "")
+            if country or city:
+                lines.append(f"出口:{' '.join(p for p in [country, city] if p)}")
+            else:
+                lines.append("出口:---")
+        else:
+            lines.append("出口:---")
+
+        # 出口 IP
+        if self._egress_geo_data:
+            query = self._egress_geo_data.get("query", "")
+            if query:
+                lines.append(f"IP:{query}")
+            else:
+                lines.append("IP:---")
+        else:
+            lines.append("IP:---")
+
+        # 出口延迟
+        if self._egress_ms is not None:
+            if self._egress_ms > 0:
+                lines.append(f"延迟:{self._egress_ms:.0f}ms")
+            elif self._egress_ms < 0:
+                lines.append("延迟:失败")
+            else:
+                lines.append("延迟:---")
+        else:
+            lines.append("延迟:---")
+
+        self.tray_icon.setToolTip("\r\n".join(lines))
+
+    def _flash_tooltip(self, msg: str, duration_ms: int = 2000):
+        """临时替换 tooltip 显示消息，到时自动恢复"""
+        self.tray_icon.setToolTip(msg)
+        QTimer.singleShot(duration_ms, self._refresh_tray_tooltip)
+
+    def _show_auto_close_msg(self, title: str, text: str, duration_ms: int = 2000):
+        """弹出居中对话框，文字和按钮完全居中，按钮带倒计时自动关闭"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 20, 24, 16)
+        layout.setSpacing(16)
+
+        label = QLabel(text)
+        label.setFont(QFont("Microsoft YaHei", 10))
+        label.setStyleSheet(f"color: {TEXT_COLOR};")
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+
+        total_seconds = max(1, round(duration_ms / 1000))
+        btn = QPushButton(f"关闭 ({total_seconds}s)")
+        btn.setFont(QFont("Microsoft YaHei", 10))
+        btn.setFixedWidth(BTN_W)
+        btn.setStyleSheet(action_btn_style(INFO, INFO_HOVER, INFO_PRESSED))
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(dlg.accept)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        dlg.adjustSize()
+        sh = dlg.sizeHint()
+        if self.isVisible() and not self.isMinimized():
+            geo = self.frameGeometry()
+            dlg.move(geo.x() + (geo.width() - sh.width()) // 2,
+                     geo.y() + (geo.height() - sh.height()) // 2)
+        else:
+            screen = QApplication.primaryScreen()
+            if screen:
+                sg = screen.availableGeometry()
+                dlg.move(sg.x() + (sg.width() - sh.width()) // 2,
+                         sg.y() + (sg.height() - sh.height()) // 2)
+
+        countdown = [total_seconds]
+
+        def tick():
+            countdown[0] -= 1
+            if countdown[0] > 0:
+                btn.setText(f"关闭 ({countdown[0]}s)")
+            else:
+                tick_timer.stop()
+                dlg.accept()
+
+        tick_timer = QTimer(dlg)
+        tick_timer.timeout.connect(tick)
+        tick_timer.start(1000)
+
+        dlg.show()
+
+    def _on_periodic_refresh(self):
+        """定时刷新到代理延迟和出口延迟"""
+        if self._proxy_enabled and self._proxy_ip and self._proxy_port:
+            try:
+                self.test_latency(self._proxy_ip, int(self._proxy_port))
+            except ValueError:
+                pass
+
+    def _copy_proxy_info(self):
+        """复制代理信息到剪贴板"""
+        if not self._proxy_enabled:
+            self._show_auto_close_msg("无法复制", "请先启用代理后再复制信息", 2500)
+            return
+
+        lines = ["已启用代理"]
+        lines.append(f"IP:{self._proxy_ip}")
+        lines.append(f"端口:{self._proxy_port}")
+
+        if self._proxy_geo_data:
+            country = self._proxy_geo_data.get("country", "")
+            city = self._proxy_geo_data.get("city", "")
+            if country or city:
+                lines.append(f"代理:{' '.join(p for p in [country, city] if p)}")
+            else:
+                lines.append("代理:---")
+        else:
+            lines.append("代理:---")
+
+        if self._tcp_ms is not None:
+            if self._tcp_ms > 0:
+                lines.append(f"延迟:{self._tcp_ms:.0f}ms")
+            else:
+                err_map = {-1: "超时", -2: "拒绝", -3: "不可达", -4: "失败"}
+                lines.append(f"延迟:{err_map.get(self._tcp_ms, '失败')}")
+        else:
+            lines.append("延迟:---")
+
+        if self._egress_geo_data:
+            country = self._egress_geo_data.get("country", "")
+            city = self._egress_geo_data.get("city", "")
+            if country or city:
+                lines.append(f"出口:{' '.join(p for p in [country, city] if p)}")
+            else:
+                lines.append("出口:---")
+            query = self._egress_geo_data.get("query", "")
+            if query:
+                lines.append(f"IP:{query}")
+            else:
+                lines.append("IP:---")
+        else:
+            lines.append("出口:---")
+            lines.append("IP:---")
+
+        if self._egress_ms is not None:
+            if self._egress_ms > 0:
+                lines.append(f"延迟:{self._egress_ms:.0f}ms")
+            elif self._egress_ms < 0:
+                lines.append("延迟:失败")
+            else:
+                lines.append("延迟:---")
+        else:
+            lines.append("延迟:---")
+
+        QApplication.clipboard().setText("\n".join(lines))
+        self._show_auto_close_msg("复制成功", "代理信息已复制到剪贴板", 1500)
 
     def toggle_proxy(self):
         """切换代理状态"""
@@ -350,13 +622,12 @@ class ProxyTool(QMainWindow):
             return
 
         try:
-            proxy_server = enable_proxy_registry(ip, port, "HTTP")
+            proxy_server = enable_proxy_registry(ip, port, "HTTP",
+                                                 bypass_local=self.bypass_cb.isChecked())
             refresh_system()
             self.save_settings()
             self.update_status()
-
-            self.lookup_geo(ip)
-            self.test_latency(ip, int(port))
+            self._show_auto_close_msg("代理已启用", f"代理地址\n{ip}:{port}", 3000)
         except (PermissionError, OSError) as e:
             self._show_error(f"注册表写入失败: {e}")
 
@@ -370,6 +641,7 @@ class ProxyTool(QMainWindow):
             self.geo_egress_label.clear()
             self.latency_tcp_label.clear()
             self.latency_egress_label.clear()
+            self._show_auto_close_msg("代理已禁用", "系统代理设置已关闭", 3000)
         except (PermissionError, OSError) as e:
             self.update_status()
             self._show_error(f"取消代理失败: {e}")
@@ -411,6 +683,7 @@ class ProxyTool(QMainWindow):
             reply.deleteLater()
 
     def display_geo(self, data: dict):
+        self._proxy_geo_data = data
         country = data.get("country", "")
         city = data.get("city", "")
         ip = data.get("query", "")
@@ -421,6 +694,7 @@ class ProxyTool(QMainWindow):
         else:
             self.geo_proxy_label.setText("代理: 无数据")
             self.geo_proxy_label.setStyleSheet(f"color: {MUTED};")
+        self._refresh_tray_tooltip()
 
     # ═══════════════════════════════════════════════════
     #  延迟
@@ -444,6 +718,10 @@ class ProxyTool(QMainWindow):
 
     def on_latency_result(self, tcp_ms: float, egress_ms: float,
                           egress_geo: dict, error: str):
+        self._tcp_ms = tcp_ms
+        self._egress_ms = egress_ms
+        self._egress_geo_data = egress_geo
+
         if tcp_ms > 0:
             color = SUCCESS_GREEN if tcp_ms < 100 else (
                 WARNING_ORANGE if tcp_ms < 500 else ERROR_RED)
@@ -470,6 +748,8 @@ class ProxyTool(QMainWindow):
         elif egress_ms < 0:
             self.latency_egress_label.setText(
                 f'<span style="color:{ERROR_RED};">出口: 失败</span>')
+
+        self._refresh_tray_tooltip()
 
     def _cleanup_latency(self):
         if self.latency_tester:
@@ -541,11 +821,18 @@ class ProxyTool(QMainWindow):
         msg.setText(html)
         msg.setStandardButtons(QMessageBox.Ok)
         msg.adjustSize()
-        # 严格居中于主窗口
+        # 主窗口可见时居中于主窗口，否则居中于屏幕
         sh = msg.sizeHint()
-        geo = self.frameGeometry()
-        msg.move(geo.x() + (geo.width() - sh.width()) // 2,
-                 geo.y() + (geo.height() - sh.height()) // 2)
+        if self.isVisible() and not self.isMinimized():
+            geo = self.frameGeometry()
+            msg.move(geo.x() + (geo.width() - sh.width()) // 2,
+                     geo.y() + (geo.height() - sh.height()) // 2)
+        else:
+            screen = QApplication.primaryScreen()
+            if screen:
+                sg = screen.availableGeometry()
+                msg.move(sg.x() + (sg.width() - sh.width()) // 2,
+                         sg.y() + (sg.height() - sh.height()) // 2)
         msg.exec_()
 
     # ═══════════════════════════════════════════════════
@@ -565,6 +852,7 @@ class ProxyTool(QMainWindow):
             self.hide()
             event.ignore()
         else:
+            self._refresh_timer.stop()
             if self.latency_tester and self.latency_tester.isRunning():
                 self.latency_tester.cancel()
                 self.latency_tester.wait(1500)

@@ -7,6 +7,16 @@ from PyQt5.QtNetwork import QNetworkRequest
 
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
+# <local> 只绕过 localhost 和 NetBIOS 名称，不绕过 IP。
+# 必须显式列出私有 IP 段，否则 192.168.x.x 等仍走代理。
+_PRIVATE_IP_BYPASS = (
+    "<local>;"
+    "10.*;"
+    + ";".join(f"172.{i}.*" for i in range(16, 32)) + ";"
+    "192.168.*;"
+    "127.*"
+)
+
 
 # ── 注册表操作 ──
 
@@ -26,12 +36,20 @@ def get_current_proxy():
         return "未知", f"无法获取 ({e})"
 
 
-def enable_proxy_registry(ip: str, port: str, proxy_type: str) -> str:
+def enable_proxy_registry(ip: str, port: str, proxy_type: str, bypass_local: bool = True) -> str:
     """写入注册表启用代理，返回写入的 ProxyServer 值"""
     proxy_server = format_proxy_server(ip, port, proxy_type)
     reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_WRITE)
     winreg.SetValueEx(reg_key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
     winreg.SetValueEx(reg_key, "ProxyServer", 0, winreg.REG_SZ, proxy_server)
+    # 绕过本地/局域网地址：<local> + 私有 IP 段通配符
+    if bypass_local:
+        winreg.SetValueEx(reg_key, "ProxyOverride", 0, winreg.REG_SZ, _PRIVATE_IP_BYPASS)
+    else:
+        try:
+            winreg.DeleteValue(reg_key, "ProxyOverride")
+        except FileNotFoundError:
+            pass
     winreg.CloseKey(reg_key)
     return proxy_server
 
@@ -40,14 +58,19 @@ def disable_proxy_registry():
     """写入注册表禁用代理"""
     reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_WRITE)
     winreg.SetValueEx(reg_key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+    # 清除本地绕过设置
+    try:
+        winreg.DeleteValue(reg_key, "ProxyOverride")
+    except FileNotFoundError:
+        pass
     winreg.CloseKey(reg_key)
 
 
 def set_bypass_local(enabled: bool):
-    """设置是否绕过本地地址 (ProxyOverride = <local>)"""
+    """设置是否绕过本地/局域网地址"""
     reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_WRITE)
     if enabled:
-        winreg.SetValueEx(reg_key, "ProxyOverride", 0, winreg.REG_SZ, "<local>")
+        winreg.SetValueEx(reg_key, "ProxyOverride", 0, winreg.REG_SZ, _PRIVATE_IP_BYPASS)
     else:
         try:
             winreg.DeleteValue(reg_key, "ProxyOverride")
@@ -57,13 +80,13 @@ def set_bypass_local(enabled: bool):
 
 
 def get_bypass_local() -> bool:
-    """读取当前是否绕过本地地址"""
+    """读取当前是否绕过本地地址（ProxyOverride 含 <local> 即为已启用）"""
     try:
         reg_key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH)
         try:
             val, _ = winreg.QueryValueEx(reg_key, "ProxyOverride")
             winreg.CloseKey(reg_key)
-            return val == "<local>"
+            return "<local>" in val
         except FileNotFoundError:
             winreg.CloseKey(reg_key)
             return False

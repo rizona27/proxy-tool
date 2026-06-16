@@ -73,4 +73,7 @@ if __name__ == "__main__":
     window = ProxyTool()
     window.show()
 
+    # 防止托盘隐藏后关闭子对话框导致应用退出
+    app.setQuitOnLastWindowClosed(False)
+
     sys.exit(app.exec_())
