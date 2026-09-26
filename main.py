@@ -1,62 +1,12 @@
-"""代理切换工具 — 入口模块（纯标准库，无第三方依赖）
+"""代理切换工具 — 入口模块
 
-依赖：Python 3.8+ 自带的 tkinter（Windows 官方安装包默认包含）
+依赖：Python 3.10+ 自带的 tkinter。
+跨平台：Windows / macOS 均可运行，平台差异收敛在 platform_ops 里。
 """
-import ctypes
 import os
-import subprocess
 import sys
 
 APP_NAME = "ProxyTool"
-MUTEX_NAME = "Global\\ProxyTool_SingleInstance_v3"
-
-
-# ── 权限 ──
-
-def is_admin() -> bool:
-    """检查是否具备管理员权限"""
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except (AttributeError, OSError):
-        return False
-
-
-def run_as_admin():
-    """以管理员权限重新启动自己（保留命令行参数）"""
-    exe = sys.executable if getattr(sys, "frozen", False) \
-        else os.path.abspath(sys.argv[0])
-    params = subprocess.list2cmdline(sys.argv[1:])
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
-
-
-# ── 单实例 ──
-
-class SingleInstance:
-    """Windows 命名互斥锁：确保只有一个实例运行。
-
-    句柄作为属性持有直到进程结束，避免被 GC 提前关闭导致互斥失效。
-    """
-
-    def __init__(self, name: str = MUTEX_NAME):
-        self._handle = None
-        self._name = name
-
-    def acquire(self) -> bool:
-        ERROR_ALREADY_EXISTS = 183
-        kernel32 = ctypes.windll.kernel32
-        self._handle = kernel32.CreateMutexW(None, False, self._name)
-        if not self._handle:
-            return True                      # 拿不到句柄时不阻塞用户
-        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            kernel32.CloseHandle(self._handle)
-            self._handle = None
-            return False
-        return True
-
-    def release(self):
-        if self._handle:
-            ctypes.windll.kernel32.CloseHandle(self._handle)
-            self._handle = None
 
 
 # ── 前置检查 ──
@@ -73,13 +23,8 @@ def check_tkinter() -> bool:
 # ── 崩溃日志 ──
 
 def log_path() -> str:
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, APP_NAME)
-    try:
-        os.makedirs(folder, exist_ok=True)
-    except OSError:
-        return os.path.join(os.path.expanduser("~"), "ProxyTool_error.log")
-    return os.path.join(folder, "error.log")
+    import platform_ops
+    return os.path.join(platform_ops.log_dir(APP_NAME), "error.log")
 
 
 def install_excepthook():
@@ -91,6 +36,7 @@ def install_excepthook():
     这里主动捕获并写入日志文件 + 弹窗，保证任何崩溃都可定位。
     """
     import traceback
+    import platform_ops
 
     def handle(exc_type, exc_value, exc_tb):
         if issubclass(exc_type, KeyboardInterrupt):
@@ -106,11 +52,10 @@ def install_excepthook():
         except OSError:
             path = "(日志写入失败)"
         try:
-            ctypes.windll.user32.MessageBoxW(
-                0,
+            platform_ops.message_box(
                 f"程序遇到未处理的错误：\n\n{exc_type.__name__}: {exc_value}\n\n"
                 f"详细信息已写入：\n{path}",
-                f"{APP_NAME} 错误", 0x10)
+                title=f"{APP_NAME} 错误", kind="error")
         except Exception:
             pass
 
@@ -130,25 +75,26 @@ def install_excepthook():
 def main():
     install_excepthook()
 
+    import platform_ops
+
     if not check_tkinter():
-        ctypes.windll.user32.MessageBoxW(
-            0,
+        platform_ops.message_box(
             "当前 Python 环境缺少 tkinter 模块。\n\n"
-            "请使用 python.org 官方安装包（勾选 tcl/tk 组件），"
-            "或改用打包好的 exe。",
-            "缺少依赖", 0x30)
+            "请使用 python.org 官方安装包（含 tcl/tk 组件），"
+            "或改用打包好的安装包。",
+            title="缺少依赖", kind="warn")
         return 1
 
-    if not is_admin():
-        run_as_admin()
+    # Windows 需要管理员权限才能可靠刷新 WinInet 代理；macOS 不需要提权
+    if platform_ops.IS_WINDOWS and not platform_ops.is_admin():
+        platform_ops.elevate()
         return 0
 
-    instance = SingleInstance()
+    instance = platform_ops.SingleInstance(APP_NAME)
     if not instance.acquire():
-        ctypes.windll.user32.MessageBoxW(
-            0,
-            "代理切换工具已在运行中（系统托盘）。\n请双击托盘图标恢复窗口。",
-            "提示", 0x40)
+        platform_ops.message_box(
+            "代理切换工具已在运行中。\n请从托盘图标恢复窗口。",
+            title="提示", kind="info")
         return 0
 
     try:

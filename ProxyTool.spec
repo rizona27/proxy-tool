@@ -59,6 +59,8 @@ a = Analysis(
         # 版本号模块与倒序日志模块要随包一起进去（运行时 import）
         ("version.py", "."),
         ("oplog.py", "."),
+        # 跨平台系统层（注册表 / networksetup 等平台差异都收在这里）
+        ("platform_ops.py", "."),
     ],
     hiddenimports=[
         "tkinter", "tkinter.ttk", "tkinter.font", "tkinter.messagebox",

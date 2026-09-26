@@ -1,12 +1,16 @@
-"""代理核心操作：注册表读写、代理类型格式化、绕过列表构建、归属地辅助
+"""代理核心操作：系统代理读写、代理类型格式化、绕过列表构建、归属地辅助
 
-纯标准库实现（winreg / ctypes / socket / json），无第三方依赖。
+纯标准库实现（platform_ops / ctypes / socket / json），无第三方依赖。
+
+跨平台：Windows 走注册表 + WinInet；macOS 走 networksetup。
+所有平台差异都收敛在 platform_ops 里，本模块只做业务语义。
 """
 import ipaddress
 import json
 import re
 import socket
-import winreg
+
+import platform_ops as _ops
 
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
@@ -78,149 +82,95 @@ def build_bypass(bypass_private_ip: bool = True,
     return ";".join(ordered)
 
 
-# ── 注册表操作 ──
-
-def _open_reg(write: bool = False):
-    access = winreg.KEY_READ | (winreg.KEY_WRITE if write else 0)
-    return winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, access)
-
-
-def _query(key, name: str):
-    try:
-        return winreg.QueryValueEx(key, name)[0]
-    except (FileNotFoundError, OSError):
-        return None
-
-
 def get_current_proxy():
-    """获取当前系统代理设置 -> (enabled: bool, status_str: str, server_str: str)"""
+    """获取当前系统代理设置 -> (enabled: bool, status_str: str, server_str: str)
+
+    跨平台：内部走 platform_ops.get_proxy_state()。
+    """
     try:
-        with _open_reg() as key:
-            enabled = bool(_query(key, "ProxyEnable"))
-            server = _query(key, "ProxyServer")
-            if server is None:
-                server = "未设置"
-            status = "已启用" if enabled else "已禁用"
-            return enabled, status, server
-    except (FileNotFoundError, PermissionError, OSError) as e:
+        state = _ops.get_proxy_state()
+        enabled = bool(state.get("enabled"))
+        server = state.get("server") or ""
+        if not server:
+            server = "未设置"
+        status = "已启用" if enabled else "已禁用"
+        return enabled, status, server
+    except Exception as e:                       # 任何平台异常都不阻塞 UI
         return False, "未知", f"无法获取 ({e})"
 
 
-def _safe_read(name: str):
-    try:
-        with _open_reg() as key:
-            return _query(key, name)
-    except OSError:
-        return None
-
-
 def read_proxy_override():
-    """读取当前 ProxyOverride 原始值，未设置返回 None"""
-    return _safe_read("ProxyOverride")
+    """读取当前绕过列表原始值（分号连接），未设置返回 None"""
+    try:
+        bypass = _ops.get_proxy_state().get("bypass") or []
+    except Exception:
+        return None
+    return ";".join(bypass) if bypass else None
 
 
 def read_autoconfig_url():
     """读取当前 PAC 脚本地址，未设置返回 None"""
-    val = _safe_read("AutoConfigURL")
-    return val if val else None
+    try:
+        pac = _ops.get_proxy_state().get("pac")
+    except Exception:
+        return None
+    return pac if pac else None
 
 
 def snapshot_proxy_settings() -> dict:
-    """快照当前代理相关注册表项，用于关闭代理时精确还原"""
-    return {
-        "ProxyEnable": _safe_read("ProxyEnable"),
-        "ProxyServer": _safe_read("ProxyServer"),
-        "ProxyOverride": _safe_read("ProxyOverride"),
-        "AutoConfigURL": _safe_read("AutoConfigURL"),
-    }
+    """快照当前代理设置，用于关闭代理时精确还原。
+
+    返回 platform_ops 的 raw 快照，结构因平台而异，但只需原样回传给
+    disable_proxy_registry()，上层无需理解内部字段。
+    """
+    try:
+        return _ops.get_proxy_state().get("raw") or {}
+    except Exception:
+        return {}
 
 
 def has_restorable_snapshot(snapshot: dict | None) -> bool:
-    """快照里是否存在需要还原的项"""
+    """快照里是否存在需要还原的项（绕过列表 / PAC）"""
     if not snapshot:
         return False
-    return bool(snapshot.get("ProxyOverride") or snapshot.get("AutoConfigURL"))
-
-
-def _set_str(key, name: str, value: str):
-    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
-
-
-def _set_dword(key, name: str, value: int):
-    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
-
-
-def _del_value(key, name: str):
-    try:
-        winreg.DeleteValue(key, name)
-    except FileNotFoundError:
-        pass
+    if _ops.IS_WINDOWS:
+        return bool(snapshot.get("ProxyOverride")
+                    or snapshot.get("AutoConfigURL"))
+    # macOS：raw 里 bypass / autoproxy 有内容即视为可还原
+    return bool(snapshot.get("bypass") or snapshot.get("autoproxy"))
 
 
 def enable_proxy_registry(host: str, port: str, bypass_override: str | None,
                           disable_pac: bool = True) -> str:
-    """写入注册表启用代理，返回写入的 ProxyServer 值。
+    """启用系统代理，返回写入的 "host:port"。
 
     Args:
-        bypass_override: ProxyOverride 值；None 表示删除该项
-        disable_pac: 是否临时清除 AutoConfigURL（PAC 优先级高于手动代理，
+        bypass_override: 分号分隔的绕过列表；None 表示不设置
+        disable_pac: 是否临时清除 PAC（PAC 优先级高于手动代理，
                      不清除会导致「显示已启用但实际不生效」）
     """
     proxy_server = format_proxy_server(host, port)
-    with _open_reg(write=True) as key:
-        _set_dword(key, "ProxyEnable", 1)
-        _set_str(key, "ProxyServer", proxy_server)
-        if bypass_override:
-            _set_str(key, "ProxyOverride", bypass_override)
-        else:
-            _del_value(key, "ProxyOverride")
-        if disable_pac:
-            _del_value(key, "AutoConfigURL")
+    bypass_list = None
+    if bypass_override:
+        bypass_list = [x for x in bypass_override.split(";") if x]
+    _ops.set_proxy(host, str(port), bypass_list, clear_pac=disable_pac)
     return proxy_server
 
 
 def disable_proxy_registry(restore: dict | None = None):
-    """禁用代理。
+    """禁用系统代理。
 
     Args:
         restore: enable 前的快照（来自 snapshot_proxy_settings）。
-                 传入时会还原用户原有的 ProxyOverride / AutoConfigURL，
-                 而不是粗暴删除 —— 避免破坏用户已有配置。
+                 传入时会还原用户原有的绕过列表 / PAC，而不是粗暴删除 ——
+                 避免破坏用户已有配置。
     """
-    with _open_reg(write=True) as key:
-        _set_dword(key, "ProxyEnable", 0)
-
-        if restore is None:
-            # 无快照：保守起见只清掉本工具可能写入的绕过列表
-            _del_value(key, "ProxyOverride")
-            return
-
-        # 还原用户原始绕过列表
-        orig_override = restore.get("ProxyOverride")
-        if orig_override:
-            _set_str(key, "ProxyOverride", orig_override)
-        else:
-            _del_value(key, "ProxyOverride")
-
-        # 还原 PAC
-        orig_pac = restore.get("AutoConfigURL")
-        if orig_pac:
-            _set_str(key, "AutoConfigURL", orig_pac)
-        else:
-            _del_value(key, "AutoConfigURL")
+    _ops.clear_proxy(restore)
 
 
 def refresh_system():
-    """通过 WinInet API 刷新系统代理设置"""
-    import ctypes
-    INTERNET_OPTION_SETTINGS_CHANGED = 39
-    INTERNET_OPTION_REFRESH = 37
-    try:
-        wininet = ctypes.windll.Wininet
-        wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
-        wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
-    except (AttributeError, OSError):
-        pass
+    """通知系统代理设置已变更（Windows: WinInet 广播；macOS: 无需）"""
+    _ops.refresh_system()
 
 
 # ── 代理服务器格式 ──

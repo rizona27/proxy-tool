@@ -38,7 +38,20 @@ _lock = threading.Lock()
 
 
 def default_log_dir() -> str:
-    """默认日志目录：exe（或脚本）所在目录"""
+    """默认日志目录。
+
+    Windows：exe（或脚本）所在目录 —— 便携，用户一眼能找到。
+    macOS  ：.app 内部通常是只读签名的，写不进去；改用
+             ~/Library/Logs/ProxyTool（系统约定的日志位置）。
+    源码模式下统一用项目目录，方便调试。
+    """
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        base = os.path.expanduser("~/Library/Logs/ProxyTool")
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError:
+            base = os.path.expanduser("~")
+        return base
     if getattr(sys, "frozen", False):
         base = os.path.dirname(os.path.abspath(sys.executable))
     else:

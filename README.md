@@ -48,19 +48,37 @@ Windows 平台 HTTP 代理一键切换工具。莫兰迪色系界面，**纯标�
 
 ## 系统要求
 
-- Windows 10/11（64 位）
+- **Windows 10/11（64 位）** —— 系统代理走注册表 `HKCU\...\Internet Settings`
+- **macOS 11+（Intel / Apple Silicon）** —— 系统代理走 `networksetup`
 - 打包版：无需安装任何环境
-- 源码运行：Python 3.8+（需含 tkinter，python.org 官方安装包默认包含）
+- 源码运行：Python 3.10+（需含 tkinter，python.org 官方安装包默认包含）
+  - macOS 建议 `brew install python-tk` 补齐 tkinter
+  - macOS 若想要托盘图标：`pip install rumps`（可选，未安装则自动降级为无托盘）
 
 ## 使用方式
 
 ### 打包版（推荐）
 
+**Windows** —— 在 Windows 上执行：
+
 ```bash
-pyinstaller ProxyTool.spec
+pyinstaller --clean --noconfirm ProxyTool.spec
 ```
 
-产出 `dist/ProxyTool.exe`，双击运行。首次启动请求管理员权限（修改系统代理需要）。
+产出 `dist/ProxyTool.exe`，双击运行。首次启动请求管理员权限（刷新 WinInet 需要）。
+
+**macOS** —— 在 macOS 上执行一键脚本：
+
+```bash
+chmod +x build_macos.sh
+./build_macos.sh
+```
+
+产出 `dist/代理切换工具.app` 与 `dist/代理切换工具 v3.0.dmg`。
+脚本会自动把 `app.ico`/`app.png` 转成 `app.icns`，再打包成 `.app` 并压缩为 `.dmg`。
+
+> ⚠️ **`dmg` 只能在 macOS 上生成**。PyInstaller 不支持跨平台编译，
+> Windows/Linux 无法产出 macOS 可执行文件 —— 这是苹果工具链的硬约束。
 
 ### 源码运行
 
@@ -68,7 +86,7 @@ pyinstaller ProxyTool.spec
 python main.py
 ```
 
-无需 `pip install` 任何依赖 —— 全部使用 Python 标准库。
+无需 `pip install` 任何依赖 —— 全部使用 Python 标准库（托盘除外，见上）。
 
 ## 界面
 
@@ -203,7 +221,8 @@ Windows 的 `<local>` 只匹配**不含点号的单标签主机名**（NetBIOS �
 程序遇到未处理异常时，会弹出错误提示并写入日志：
 
 ```
-%APPDATA%\ProxyTool\error.log
+Windows : %APPDATA%\ProxyTool\error.log
+macOS   : ~/Library/Logs/ProxyTool/error.log
 ```
 
 直接访问该文件即可看到完整堆栈，便于定位问题。
@@ -211,26 +230,38 @@ Windows 的 `<local>` 只匹配**不含点号的单标签主机名**（NetBIOS �
 ## 技术实现
 
 - **GUI**：Tkinter + 自绘 Canvas 控件（圆角按钮 / 输入框 / iOS 药丸开关）
-- **系统托盘**：ctypes 直接调用 Shell_NotifyIconW，无需 pystray
-- **代理设置**：注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+- **系统托盘**：
+  - Windows：ctypes 直接调用 `Shell_NotifyIconW`，零依赖
+  - macOS：优先 pystray，其次 rumps，都没有则无托盘（主功能不受影响）
+- **系统代理**（全部收敛在 `platform_ops.py`）：
+  - Windows：注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+    + WinInet `InternetSetOptionW` 刷新
+  - macOS：`networksetup -setwebproxy/-setsecurewebproxy/-setproxybypassdomains`
 - **归属地**：ip-api.com 免费 API（urllib 异步线程）
 - **延迟**：TCP socket（短超时轮询）+ urllib HTTP 往返测时
-- **打包**：PyInstaller + UPX
+- **打包**：PyInstaller（Windows 版 UPX 压缩；macOS 版不打 UPX，避免签名/加载问题）
 
 ## 模块结构
 
 ```
 proxy-tool/
-├── main.py              # 入口 + 管理员提权 + 单实例互斥 + 全局异常钩子
-├── version.py           # ★ 版本号唯一定义处（改这里即全局生效）
-├── main_window.py       # 主窗口 UI 与业务逻辑 + Readme 弹窗
-├── widgets.py           # 自绘控件库（按钮/输入框/iOS 药丸开关/链接）
-├── styles.py            # 莫兰迪色系样式常量
-├── proxy_core.py        # 注册表读写 + 绕过列表 + 校验 + 归属地
-├── latency_tester.py    # 延迟检测 + 归属地查询线程
-├── tray.py              # Windows 原生系统托盘（ctypes）
-├── ProxyTool.spec       # PyInstaller 打包配置（含瘦身排除清单）
-└── app.ico              # 应用图标（多尺寸 16→256）
+├── main.py                 # 入口 + 提权(仅Win) + 单实例 + 全局异常钩子
+├── version.py              # ★ 版本号唯一定义处（改这里即全局生效）
+├── platform_ops.py         # ★ 跨平台系统层（注册表 / networksetup / 弹窗 / 单实例）
+├── main_window.py          # 主窗口 UI 与业务逻辑 + Readme 弹窗
+├── widgets.py              # 自绘控件库（按钮/输入框/iOS 药丸开关/链接）
+├── styles.py               # 莫兰迪色系样式常量
+├── proxy_core.py           # 系统代理读写 + 绕过列表 + 校验 + 归属地
+├── latency_tester.py       # 延迟检测 + 归属地查询线程
+├── tray.py                 # 系统托盘（按平台分派）
+├── oplog.py                # 倒序操作日志
+├── ProxyTool.spec          # PyInstaller 打包配置 —— Windows
+├── ProxyTool-macos.spec    # PyInstaller 打包配置 —— macOS (.app)
+├── build_windows.bat       # 一键打包 Windows .exe
+├── build_macos.sh          # 一键打包 macOS .app + .dmg
+├── tools_ico2png.py        # 从 app.ico 抽取 256×256 PNG（macOS icns 源）
+├── app.ico                 # 应用图标源（多尺寸 16→256）
+└── app.png                 # 256×256 PNG（由 app.ico 提取，macOS 用）
 ```
 
 ## 体积优化说明

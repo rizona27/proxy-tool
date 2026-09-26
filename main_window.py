@@ -1,6 +1,6 @@
 """主窗口 — 莫兰迪风格紧凑界面 + 系统托盘
 
-纯标准库 Tkinter 实现，零第三方依赖。
+纯标准库 Tkinter 实现，零第三方依赖（托盘在 macOS 下可选依赖 rumps）。
 """
 import os
 import queue
@@ -9,6 +9,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox
 
+import platform_ops as _ops
 from styles import (
     BG_COLOR, CARD_COLOR, TEXT_COLOR, LABEL_COLOR, MUTED, BORDER_COLOR,
     PRIMARY, DANGER, INFO, INACTIVE_LABEL, MAILTO_COLOR,
@@ -580,11 +581,7 @@ class ProxyTool:
                 parent=self.root)
             return
         try:
-            os.startfile(path)          # Windows
-        except AttributeError:
-            import subprocess
-            opener = "open" if sys.platform == "darwin" else "xdg-open"
-            subprocess.Popen([opener, path])
+            _ops.open_path(path)        # Windows startfile / macOS open / Linux xdg-open
         except OSError as e:
             messagebox.showerror("无法打开", f"打开日志失败：{e}",
                                  parent=self.root)
@@ -832,10 +829,10 @@ class ProxyTool:
     # ═══════════════════════════════════════════
 
     def _setup_tray(self):
-        """Windows 原生托盘图标（ctypes 实现，无第三方依赖）"""
+        """系统托盘图标（按平台分派：Windows 原生 / macOS rumps / 降级空实现）"""
         try:
-            from tray import TrayIcon
-            self._tray = TrayIcon(
+            from tray import get_tray
+            self._tray = get_tray(
                 icon_path=self._icon_path(),
                 tooltip=self._tray_tooltip(),
                 on_toggle=self._toggle_proxy_from_tray,
@@ -849,43 +846,48 @@ class ProxyTool:
             self._tray = None
 
     def _icon_path(self):
-        """应用图标路径（打包后从 _MEIPASS 取，源码模式取同目录）"""
+        """应用图标路径（打包后从 _MEIPASS 取，源码模式取同目录）。
+
+        Windows 用 .ico；macOS 用 .icns（打包后放进 Resources）。
+        """
         base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        for name in ("app.ico", "app.png"):
+        names = ("app.icns", "app.ico", "app.png") if sys.platform == "darwin" \
+            else ("app.ico", "app.png")
+        for name in names:
             p = os.path.join(base, name)
             if os.path.exists(p):
                 return p
         return ""
 
     def _apply_window_icon(self):
-        """把 app.ico 设为窗口标题栏左上角图标（含任务栏）"""
+        """把应用图标设为窗口标题栏左上角图标（含任务栏 / Dock）"""
         path = self._icon_path()
         if not path:
             return
-        # 1) iconbitmap：Windows 下同时作用于标题栏与任务栏
-        try:
-            self.root.iconbitmap(default=path)
-        except tk.TclError:
+        # 1) Windows: iconbitmap 同时作用于标题栏与任务栏
+        #    macOS:  tk 的 iconbitmap 不支持 .icns，跳过（.app 的 Dock 图标
+        #           由 Info.plist 的 CFBundleIconFile 指定）
+        if not _ops.IS_MACOS:
             try:
-                self.root.iconbitmap(path)
+                self.root.iconbitmap(default=path)
             except tk.TclError:
-                pass
-        # 2) 同时用 iconphoto 兜底（部分 DPI/主题下 iconbitmap 会被忽略）
+                try:
+                    self.root.iconbitmap(path)
+                except tk.TclError:
+                    pass
+        # 2) iconphoto 兜底（跨平台可用；PNG 最稳）
         try:
-            from PIL import Image, ImageTk   # 可选，无则跳过
-            img = Image.open(path)
-            self._icon_photo = ImageTk.PhotoImage(img)
+            pk = path
+            if path.lower().endswith(".icns"):
+                pk = os.path.join(os.path.dirname(path), "app.png")
+                if not os.path.exists(pk):
+                    pk = path
+            self._icon_photo = tk.PhotoImage(file=pk)
             self.root.iconphoto(True, self._icon_photo)
         except Exception:
             pass
-        # 3) 通过 Win32 API 再设一次 AppUserModelID 与窗口图标，
-        #    确保任务栏使用自定义图标而非默认 Tk 图标
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "ProxyTool.App.3")
-        except Exception:
-            pass
+        # 3) Windows：再设一次 AppUserModelID，确保任务栏用自定义图标
+        _ops.set_app_user_model_id("ProxyTool.App.3")
 
 
     def _tray_tooltip(self):
@@ -1098,17 +1100,18 @@ class ProxyTool:
 
         def _outer_rect(tkwin):
             """返回 (x, y, w, h) 外框坐标；失败时用 Tk 客户区兜底"""
-            try:
-                import ctypes
-                from ctypes import wintypes
-                hwnd = int(tkwin.frame(), 16)
-                rc = wintypes.RECT()
-                if ctypes.windll.user32.GetWindowRect(
-                        ctypes.c_void_p(hwnd), ctypes.byref(rc)):
-                    return (rc.left, rc.top,
-                            rc.right - rc.left, rc.bottom - rc.top)
-            except Exception:
-                pass
+            if _ops.IS_WINDOWS:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    hwnd = int(tkwin.frame(), 16)
+                    rc = wintypes.RECT()
+                    if ctypes.windll.user32.GetWindowRect(
+                            ctypes.c_void_p(hwnd), ctypes.byref(rc)):
+                        return (rc.left, rc.top,
+                                rc.right - rc.left, rc.bottom - rc.top)
+                except Exception:
+                    pass
             return (tkwin.winfo_rootx(), tkwin.winfo_rooty(),
                     tkwin.winfo_width(), tkwin.winfo_height())
 
