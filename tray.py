@@ -474,15 +474,21 @@ def _make_macos_tray(icon_path="", tooltip="代理切换工具",
 
 
 def _load_pil_icon(Image):
-    """给 pystray 准备一张 PIL 图：优先 app.png，其次从 app.ico 转，最后画个占位。"""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    png = os.path.join(base, "app.png")
-    if os.path.exists(png):
-        return Image.open(png)
-    ico = os.path.join(base, "app.ico")
-    if os.path.exists(ico):
+    """给 pystray 准备一张 PIL 图：优先 app.png / app.ico，最后画个占位。
+
+    打包后资源可能在 _MEIPASS（onefile）、Contents/Resources（onedir .app）
+    或与可执行文件同目录（onedir 平铺），统一交给 platform_ops.find_resource
+    按优先级查找。
+    """
+    png = ""
+    try:
+        import platform_ops
+        png = platform_ops.find_resource(("app.png", "app.ico"))
+    except Exception:
+        pass
+    if png:
         try:
-            return Image.open(ico)
+            return Image.open(png)
         except Exception:
             pass
     return Image.new("RGBA", (64, 64), (120, 150, 200, 255))

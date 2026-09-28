@@ -8,7 +8,7 @@
 #
 #  产物：
 #      dist/代理切换工具.app
-#      dist/代理切换工具 v3.0.dmg
+#      dist/代理切换工具 v1.01.dmg
 #
 #  前置条件：
 #      · macOS 11+，已装 python3（推荐 python.org 官方包，自带 tkinter）
@@ -24,7 +24,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="代理切换工具"
-VERSION="$(python3 -c 'import version; print(version.VERSION)' 2>/dev/null || echo 3.0)"
+VERSION="$(python3 -c 'import version; print(version.VERSION)' 2>/dev/null || echo 1.01)"
 VOL_NAME="${APP_NAME} v${VERSION}"
 DMG_PATH="dist/${VOL_NAME}.dmg"
 

@@ -77,6 +77,7 @@ class ProxyTool:
 
         self._build_ui()
         self._setup_tray()
+        self._setup_mac_dock()
         self._fit_window()
 
         # 窗口就绪后再落一条启动记录（此时 set_enabled 会创建文件）
@@ -845,19 +846,37 @@ class ProxyTool:
             # 托盘不可用不应阻塞主功能
             self._tray = None
 
-    def _icon_path(self):
-        """应用图标路径（打包后从 _MEIPASS 取，源码模式取同目录）。
+    def _setup_mac_dock(self):
+        """macOS：点击 Dock 图标时恢复主窗口。
 
-        Windows 用 .ico；macOS 用 .icns（打包后放进 Resources）。
+        macOS 的惯例是「关窗 ≠ 退出」：红色关闭按钮把窗口藏起来后
+        （_on_close 走 withdraw 分支），进程仍存活。此时点 Dock 图标，
+        系统向应用发出 reopen 事件 —— tkinter 默认不响应这个事件，
+        表现为「点 Dock 图标没反应」。这里通过 Tk 的
+        ::tk::mac::ReopenApplication 钩子把事件接到恢复窗口上。
+        其它平台为 no-op。
         """
-        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-        names = ("app.icns", "app.ico", "app.png") if sys.platform == "darwin" \
+        if not _ops.IS_MACOS:
+            return
+        try:
+            cmd = self.root.register(self._do_show_window)
+            self.root.tk.eval(
+                "proc ::tk::mac::ReopenApplication {} { " + cmd + " }")
+        except tk.TclError:
+            # 钩子注册失败不影响主功能，只是点 Dock 图标不恢复窗口
+            pass
+
+    def _icon_path(self):
+        """应用图标路径。
+
+        Windows 用 .ico；macOS 用 .icns（.app 的 Dock 图标由 Info.plist 的
+        CFBundleIconFile 指定，这里只管窗口标题栏 / iconphoto 兜底）。
+        打包后从资源目录取（onedir 的 datas 在 Contents/Resources，
+        见 platform_ops.resource_dirs），源码模式取同目录。
+        """
+        names = ("app.icns", "app.ico", "app.png") if _ops.IS_MACOS \
             else ("app.ico", "app.png")
-        for name in names:
-            p = os.path.join(base, name)
-            if os.path.exists(p):
-                return p
-        return ""
+        return _ops.find_resource(names)
 
     def _apply_window_icon(self):
         """把应用图标设为窗口标题栏左上角图标（含任务栏 / Dock）"""
@@ -955,6 +974,7 @@ class ProxyTool:
         内容：分组折叠卡片，默认只展开「快速上手」，其余点击标题行展开。
         """
         win = tk.Toplevel(self.root)
+        win.withdraw()          # 创建即隐藏：定位完成前不显示，避免闪现
         win.title(f"关于 {APP_NAME}")
         win.configure(bg=BG_COLOR)
         win.resizable(False, False)
@@ -1048,8 +1068,9 @@ class ProxyTool:
         tk.Frame(card, bg=BORDER_COLOR, height=1).pack(fill="x")
         foot = tk.Frame(card, bg=CARD_COLOR)
         foot.pack(fill="x", padx=13, pady=(6, 8))
-        label(foot, "滚动查看更多 · Esc 关闭", size=8, color=MUTED,
-              bg=CARD_COLOR, anchor="w").pack(side="left")
+        foot_hint = label(foot, "滚动查看更多 · Esc 关闭", size=8,
+                          color=MUTED, bg=CARD_COLOR, anchor="w")
+        foot_hint.pack(side="left")
 
         # ── 滚轮：只在指针位于弹窗内时生效 ──
         # 关键：<Enter>/<Leave> 不冒泡，只绑 canvas/inner/body 时，
@@ -1091,6 +1112,37 @@ class ProxyTool:
         # 等所有子控件都创建完再整体绑定（body 下已挂满折叠分组）
         win.after_idle(lambda: _bind_tree(canvas))
 
+        # ── 高度自适应：取「最高的分组完全展开」所需高度，一屏装下免滚动 ──
+        # 原理：弹窗请求高度 = 画布请求高度 + 画布以外的固定开销（卡片
+        # 内边距 / 分隔线 / 页脚）。逐组展开量画布内容（inner）的请求高度，
+        # 套上固定开销即该展开态所需客户区高度，取各组最大值。
+        try:
+            # 测量期间禁止 <Configure> 按未映射的小宽度重设折行
+            canvas.unbind("<Configure>")
+            try:
+                _apply_wrap(win_w - 16 - 9 - 26)   # 用保守（偏窄）折行口径
+                win.update_idletasks()
+                chrome = win.winfo_reqheight() - canvas.winfo_reqheight()
+                max_inner = 0
+                for sec in sections:
+                    sec.expand()               # 手风琴：展开会自动折叠其它组
+                    win.update_idletasks()
+                    max_inner = max(max_inner, inner.winfo_reqheight())
+                sections[0].expand()           # 恢复默认展开「快速上手」
+                win.update_idletasks()
+
+                needed = int(max_inner + chrome + 6)   # 6px 呼吸余量
+                avail = win.winfo_screenheight() - 120  # 与 _readme_size 同口径
+                if needed <= avail:
+                    win_h = needed             # 正常屏幕：一屏装下免滚动
+                    foot_hint.configure(text="Esc 关闭")
+                    vbar.pack_forget()         # 滚动条已无意义
+            finally:
+                canvas.bind("<Configure>", _on_canvas_configure)
+        except Exception:
+            # 测量失败保持 _readme_size 的默认高度（可滚动），不影响主功能
+            pass
+
         # ── 定位：弹窗外框中心对齐主窗口外框中心 ──
         # Tk 的 winfo_rootx/rooty 返回「客户区」原点，不含边框与标题栏；
         # 直接用它算居中会出现固定偏移（本机实测 +8 / +31）。
@@ -1115,10 +1167,22 @@ class ProxyTool:
             return (tkwin.winfo_rootx(), tkwin.winfo_rooty(),
                     tkwin.winfo_width(), tkwin.winfo_height())
 
-        # 先把弹窗摆到屏幕外并 force 布局，拿到真实外框尺寸
-        win.geometry(f"{win_w}x{win_h}+-32000+-32000")
-        win.update_idletasks()
-        _, _, dlg_ow, dlg_oh = _outer_rect(win)
+        # ── 弹窗外框测量与定位（分平台） ──
+        # · Windows：允许窗口完全放到屏幕外 —— 屏幕外映射后用
+        #   GetWindowRect 拿真实外框，全程用户不可见。
+        # · macOS：系统会把窗口位置强制钳回可视屏幕，屏幕外映射会
+        #   变成「出现在屏幕边缘」，产生可见位移。而 Tk 在 macOS 用
+        #   winfo 返回的是客户区坐标，不映射也能算 —— 因此全程保持
+        #   隐藏，直接用设定的几何尺寸计算，把最终坐标设好才显示。
+        if _ops.IS_WINDOWS:
+            win.geometry(f"{win_w}x{win_h}+-32000+-32000")
+            win.update_idletasks()
+            win.deiconify()          # Windows 不钳位：在屏幕外完成映射
+            win.update_idletasks()
+            _, _, dlg_ow, dlg_oh = _outer_rect(win)
+        else:
+            # macOS/其它：客户区尺寸即设定的 geometry，无需映射测量
+            dlg_ow, dlg_oh = win_w, win_h
 
         self.root.update_idletasks()
         rx, ry, rw, rh = _outer_rect(self.root)
@@ -1136,6 +1200,11 @@ class ProxyTool:
         y = max(10, min(y, sh - dlg_oh - 40))
         win.geometry(f"{win_w}x{win_h}+{x}+{y}")
         win.update_idletasks()
+        if not _ops.IS_WINDOWS:
+            # macOS：最终坐标已设好才首次映射 —— 窗口一出生就在
+            # 中心，不存在任何位移过程
+            win.deiconify()
+            win.update_idletasks()
 
         win.bind("<Escape>", lambda e: self._close_readme())
 
@@ -1163,11 +1232,12 @@ class ProxyTool:
 
     @staticmethod
     def _readme_size():
-        """Readme 弹窗尺寸：宽比主窗口略窄，高比主窗口略大。
+        """Readme 弹窗尺寸：宽比主窗口略窄，高按内容自适应。
 
         主窗口 320 宽 —— 这里取 300 宽（两侧各收 10px）。
-        高度：页头（应用名 + 版本 + 副标题）已取消，省下的空间全部让给
-        滚动内容区，因此在原基础上再增高，一屏能多看 1~2 个折叠分组。
+        高度：WIN_H + 150 只是保底（小屏收缩 / 测量失败时用）；
+        正常情况下 _build_readme_dialog 会按「最高的分组完全展开」
+        所需高度自适应调高，一屏装下全部内容免滚动。
         同时受屏幕尺寸约束，小屏下自动收缩。
         """
         w = WIN_W - 20

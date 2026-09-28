@@ -439,6 +439,44 @@ def log_dir(app_name: str = "ProxyTool") -> str:
     return folder
 
 
+def resource_dirs() -> list[str]:
+    """打包资源（app.png / app.icns 等）的候选目录，按优先级排列。
+
+    各种运行形态的落点不同：
+      · onefile        —— 全部资源解压在 sys._MEIPASS（临时目录）
+      · onedir .app    —— 可执行文件在 Contents/MacOS，数据文件在
+                          Contents/Resources（sys._MEIPASS 指向
+                          Contents/Frameworks，不含 datas，必须另找）
+      · onedir 平铺    —— 与可执行文件同目录
+      · 源码运行       —— 与本模块同目录
+    """
+    dirs: list[str] = []
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        dirs.append(meipass)
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    dirs.append(exe_dir)
+    dirs.append(os.path.normpath(os.path.join(exe_dir, "..", "Resources")))
+    dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def find_resource(names: tuple[str, ...] | list[str]) -> str:
+    """按候选目录顺序查找第一个存在的资源文件，找不到返回空串。"""
+    for d in resource_dirs():
+        for name in names:
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return p
+    return ""
+
+
 def is_admin() -> bool:
     """是否具备修改系统代理所需的权限。
 

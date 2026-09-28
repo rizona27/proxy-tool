@@ -186,5 +186,7 @@ cython_debug/
 # ── 本地 / OS / AI 工作区（不纳入版本控制） ──
 # macOS
 .DS_Store
+# 构建中间产物（build_macos.sh 自动从 app.ico / app.png 生成）
+app.icns
 # AI 助手工作区（本地记忆等）
 .workbuddy/
