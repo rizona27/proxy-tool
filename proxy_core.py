@@ -181,7 +181,7 @@ def format_proxy_server(host: str, port: str) -> str:
 
 
 def _split_host_port(value: str):
-    """拆分 host:port，兼容 IPv6 方括号写法 [::1]:7890"""
+    """拆分 host:port，兼容 IPv6 方括号写法 [::1]:8080"""
     value = (value or "").strip()
     if value.startswith("["):
         idx = value.find("]")

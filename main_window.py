@@ -2,6 +2,7 @@
 
 纯标准库 Tkinter 实现，零第三方依赖（托盘在 macOS 下可选依赖 rumps）。
 """
+import json
 import os
 import queue
 import sys
@@ -42,6 +43,10 @@ SW_W, SW_H = 29, 16
 # Readme 折叠分组标题行的浅色带（比卡片底色略深一点点）
 _SECTION_BG = "#f1eee8"
 
+# Readme 弹窗高度上限：分组展开时窗口最多长到这里，再高改为内部滚动。
+# 默认（全折叠）约 305px；最长的「地址输入」展开约 523px，会被压到 420px 滚动。
+_README_MAX_H = 420
+
 
 class ProxyTool:
     def __init__(self):
@@ -69,6 +74,7 @@ class ProxyTool:
         self._tray = None
 
         self._load_settings()
+        self._load_snapshot()
 
         # ── 操作日志（默认路径：exe/脚本同目录） ──
         self.logger = OperationLogger(
@@ -156,11 +162,47 @@ class ProxyTool:
         self.root.minsize(WIN_W, need_h)
         self.root.maxsize(WIN_W, need_h)
 
-    def _settings_path(self):
+    def _config_dir(self):
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
         folder = os.path.join(base, "ProxyTool")
         os.makedirs(folder, exist_ok=True)
-        return os.path.join(folder, "settings.ini")
+        return folder
+
+    def _settings_path(self):
+        return os.path.join(self._config_dir(), "settings.ini")
+
+    def _snapshot_path(self):
+        return os.path.join(self._config_dir(), "proxy_snapshot.json")
+
+    def _load_snapshot(self):
+        """读回「启用代理前」的快照。
+
+        快照必须落盘：若用户在有代理的状态下退出（或崩溃），下次启动
+        再点「取消代理」时仍要能精确还原其原有绕过列表 / PAC。
+        """
+        try:
+            with open(self._snapshot_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        snap = data.get("snapshot") if isinstance(data, dict) else None
+        if isinstance(snap, dict):
+            self._orig_snapshot = snap
+
+    def _save_snapshot(self, snapshot):
+        """落盘快照；snapshot=None 表示释放（删除文件）"""
+        path = self._snapshot_path()
+        try:
+            if snapshot is None:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                return
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "snapshot": snapshot}, f)
+        except OSError:
+            pass
 
     def _load_settings(self):
         self._cfg = {"proxy_host": "", "proxy_port": "", "bypass_local": "1",
@@ -664,8 +706,14 @@ class ProxyTool:
                 bypass_private_ip=True, extra_hosts=None)
 
         try:
-            # 启用前快照，供关闭时还原用户原有配置
-            self._orig_snapshot = snapshot_proxy_settings()
+            # 启用前快照，供关闭时还原用户原有配置。
+            # 只在尚未持有快照时抓取：用户若在有代理的状态下退出，重启后
+            # 再次启用会抓到我们自己写进去的绕过列表，从而丢掉真正的原值。
+            if self._orig_snapshot is None:
+                snap = snapshot_proxy_settings()
+                if snap:
+                    self._orig_snapshot = snap
+                    self._save_snapshot(snap)
             pac = read_autoconfig_url()
 
             enable_proxy_registry(host, port, bypass, disable_pac=True)
@@ -701,6 +749,8 @@ class ProxyTool:
                        if has_restorable_snapshot(self._orig_snapshot) else None)
             disable_proxy_registry(restore)
             refresh_system()
+            self._orig_snapshot = None
+            self._save_snapshot(None)
             self._save_settings()
             self._refresh_status()
             self.logger.ok("取消代理" + ("（已还原原有设置）" if restore else ""))
@@ -968,10 +1018,11 @@ class ProxyTool:
     def _build_readme_dialog(self):
         """自建 Readme 对话框。
 
-        尺寸：宽比主窗口略窄，高比主窗口略大（见 _readme_size）。
+        尺寸：宽比主窗口略窄，高按当前可见内容自适应（上限见 _README_MAX_H）——
+              展开/折叠分组时同步伸缩，超过上限才出现滚动条（见 _fit_height）。
         结构：固定标题栏 + 可滚动内容区 + 底部提示，无关闭按钮 ——
               窗口自带标题栏的 X（以及 Esc）即可关闭。
-        内容：分组折叠卡片，默认只展开「快速上手」，其余点击标题行展开。
+        内容：分组折叠卡片，默认全部折叠（弹窗最矮），点击标题行展开一组。
         """
         win = tk.Toplevel(self.root)
         win.withdraw()          # 创建即隐藏：定位完成前不显示，避免闪现
@@ -1042,9 +1093,9 @@ class ProxyTool:
 
         # ══════ 折叠分组内容（手风琴：同时只展开一组） ══════
         sections = []
-        for idx, (title, lines) in enumerate(self._readme_sections()):
+        for title, lines in self._readme_sections():
             sec = self._readme_section(body, canvas, title, lines,
-                                       expanded=(idx == 0),
+                                       expanded=False,   # 默认全折叠：弹窗最矮
                                        wrap_refs=_wrap_refs,
                                        extra=self._readme_section_extra(
                                            title, canvas))
@@ -1112,36 +1163,77 @@ class ProxyTool:
         # 等所有子控件都创建完再整体绑定（body 下已挂满折叠分组）
         win.after_idle(lambda: _bind_tree(canvas))
 
-        # ── 高度自适应：取「最高的分组完全展开」所需高度，一屏装下免滚动 ──
-        # 原理：弹窗请求高度 = 画布请求高度 + 画布以外的固定开销（卡片
-        # 内边距 / 分隔线 / 页脚）。逐组展开量画布内容（inner）的请求高度，
-        # 套上固定开销即该展开态所需客户区高度，取各组最大值。
+        # ── 高度自适应：只按「当前可见内容」定高，展开/折叠时同步伸缩 ──
+        # 固定开销 chrome = 弹窗请求高度 - 画布请求高度（卡片内边距 /
+        # 分隔线 / 页脚）—— 画布请求高度是常量、与内容无关，故 chrome
+        # 在映射前即可稳定测出。内容高度必须等窗口映射后再测：映射前
+        # 折行宽度尚未按真实画布宽度收敛，量出来会偏大（实测多 ~48px）。
+        canvas.unbind("<Configure>")           # 冻结折行重算，避免测量抖动
+        _apply_wrap(win_w - 16 - 9 - 26)
         try:
-            # 测量期间禁止 <Configure> 按未映射的小宽度重设折行
-            canvas.unbind("<Configure>")
-            try:
-                _apply_wrap(win_w - 16 - 9 - 26)   # 用保守（偏窄）折行口径
-                win.update_idletasks()
-                chrome = win.winfo_reqheight() - canvas.winfo_reqheight()
-                max_inner = 0
-                for sec in sections:
-                    sec.expand()               # 手风琴：展开会自动折叠其它组
-                    win.update_idletasks()
-                    max_inner = max(max_inner, inner.winfo_reqheight())
-                sections[0].expand()           # 恢复默认展开「快速上手」
-                win.update_idletasks()
+            win.update_idletasks()
+            chrome = max(0, win.winfo_reqheight() - canvas.winfo_reqheight())
+            cap = min(_README_MAX_H, win.winfo_screenheight() - 120)
+        finally:
+            canvas.bind("<Configure>", _on_canvas_configure)
 
-                needed = int(max_inner + chrome + 6)   # 6px 呼吸余量
-                avail = win.winfo_screenheight() - 120  # 与 _readme_size 同口径
-                if needed <= avail:
-                    win_h = needed             # 正常屏幕：一屏装下免滚动
+        _scroll = {"on": True}                 # 与初始（滚动条已 pack）一致
+
+        def _fit_height(move=True):
+            """按当前展开状态重设高度：贴内容长，超过上限才滚动。
+
+            move=False 时只改尺寸、不动位置 —— 初始定位阶段窗口还在
+            屏幕外（-32000）做测量，一旦在这里算坐标就会被钳到屏幕内
+            的左上角，用户会看到「先在左边闪一下再跳到中间」。
+            """
+            nonlocal win_h
+            try:
+                win.update_idletasks()
+                content = inner.winfo_reqheight()
+            except tk.TclError:
+                return
+            need = int(content + chrome + 6)
+            scrollable = need > cap
+            win_h = max(220, min(need, cap))
+            if scrollable != _scroll["on"]:
+                _scroll["on"] = scrollable
+                if scrollable:
+                    vbar.pack(side="right", fill="y", before=canvas)
+                    foot_hint.configure(text="滚动查看更多 · Esc 关闭")
+                else:
+                    vbar.pack_forget()
                     foot_hint.configure(text="Esc 关闭")
-                    vbar.pack_forget()         # 滚动条已无意义
-            finally:
-                canvas.bind("<Configure>", _on_canvas_configure)
-        except Exception:
-            # 测量失败保持 _readme_size 的默认高度（可滚动），不影响主功能
-            pass
+            if not scrollable:
+                try:
+                    canvas.yview_moveto(0)
+                except tk.TclError:
+                    pass
+            if not move:
+                # 只设宽高（Tk 会保留当前位置），窗口继续留在屏幕外
+                win.geometry(f"{win_w}x{win_h}")
+                return
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            x = max(10, min(win.winfo_x(), sw - win_w - 10))
+            y = win.winfo_y()
+            if y + win_h > sh - 40:            # 向下长不出去时向上收
+                y = sh - 40 - win_h
+            y = max(10, y)
+            win.geometry(f"{win_w}x{win_h}+{x}+{y}")
+
+        # 展开/折叠后重设高度；after_idle 合并手风琴的连续变化，避免抖动
+        _fit_job = {"id": None}
+
+        def _schedule_fit():
+            if _fit_job["id"] is not None:
+                try:
+                    win.after_cancel(_fit_job["id"])
+                except tk.TclError:
+                    pass
+            _fit_job["id"] = win.after_idle(_fit_height)
+
+        for sec in sections:
+            sec.on_change = _schedule_fit
 
         # ── 定位：弹窗外框中心对齐主窗口外框中心 ──
         # Tk 的 winfo_rootx/rooty 返回「客户区」原点，不含边框与标题栏；
@@ -1178,6 +1270,10 @@ class ProxyTool:
             win.geometry(f"{win_w}x{win_h}+-32000+-32000")
             win.update_idletasks()
             win.deiconify()          # Windows 不钳位：在屏幕外完成映射
+            win.update()             # 跑完整事件循环：等 WM 应用尺寸后再测
+            # 只改尺寸不挪位置：此刻窗口还在屏幕外，一旦在这里算坐标
+            # 就会被钳到屏幕左上角，表现为「左边闪一下再跳到中间」
+            _fit_height(move=False)
             win.update_idletasks()
             _, _, dlg_ow, dlg_oh = _outer_rect(win)
         else:
@@ -1204,6 +1300,8 @@ class ProxyTool:
             # macOS：最终坐标已设好才首次映射 —— 窗口一出生就在
             # 中心，不存在任何位移过程
             win.deiconify()
+            win.update_idletasks()
+            _fit_height()            # 映射后折行已收敛，此时定高才准
             win.update_idletasks()
 
         win.bind("<Escape>", lambda e: self._close_readme())
@@ -1232,16 +1330,16 @@ class ProxyTool:
 
     @staticmethod
     def _readme_size():
-        """Readme 弹窗尺寸：宽比主窗口略窄，高按内容自适应。
+        """Readme 弹窗尺寸：宽比主窗口略窄，高为兜底值。
 
         主窗口 320 宽 —— 这里取 300 宽（两侧各收 10px）。
-        高度：WIN_H + 150 只是保底（小屏收缩 / 测量失败时用）；
-        正常情况下 _build_readme_dialog 会按「最高的分组完全展开」
-        所需高度自适应调高，一屏装下全部内容免滚动。
+        高度：_README_MAX_H 只是兜底（测量失败时用）；正常情况下
+        _build_readme_dialog 会按当前可见内容精确算高（上限同值），
+        展开/折叠分组时同步伸缩，超过上限才滚动。
         同时受屏幕尺寸约束，小屏下自动收缩。
         """
         w = WIN_W - 20
-        h = WIN_H + 150
+        h = _README_MAX_H
         try:
             sw = tk._default_root.winfo_screenwidth()
             sh = tk._default_root.winfo_screenheight()
@@ -1263,7 +1361,7 @@ class ProxyTool:
             ]),
             ("地址输入", [
                 "支持 IPv4、域名（proxy.example.com）、IPv6（[::1]）",
-                "输入 IP 自动补点分段：192168111 → 192.168.1.11",
+                "输入 IP 自动补点分段：1921681001 → 192.168.100.1",
                 "TAB 逐段跳转：输到 192.168 按 TAB 自动补点并进入第 3 段",
                 "走到第 4 段末尾后，TAB 才切换焦点到端口框",
                 "字符白名单：只放行数字、字母与 . - _ : [ ]",
@@ -1356,7 +1454,7 @@ class ProxyTool:
         strip = tk.Frame(block, bg=_SECTION_BG)
         strip.pack(fill="x")
 
-        state = {"open": bool(expanded), "on_open": None}
+        state = {"open": bool(expanded), "on_open": None, "on_change": None}
         arrow = tk.Label(strip, text="", bg=_SECTION_BG, fg=PRIMARY,
                          font=(FONT_FAMILY, 8), cursor="hand2")
         arrow.pack(side="left", padx=(6, 4), pady=3)
@@ -1400,6 +1498,14 @@ class ProxyTool:
             def on_open(self, cb):
                 self._state["on_open"] = cb
 
+            @property
+            def on_change(self):
+                return self._state["on_change"]
+
+            @on_change.setter
+            def on_change(self, cb):
+                self._state["on_change"] = cb
+
         sec = _Section()
         sec._state = state
         sec.title = title
@@ -1425,6 +1531,9 @@ class ProxyTool:
                 content.pack_forget()
                 arrow.configure(text="▶")
             _refresh_scroll()
+            cb = state.get("on_change")
+            if callable(cb):
+                cb()                           # 通知外部按新内容重设高度
 
         def _expand(notify=True):
             _set_open(True, notify)

@@ -100,35 +100,36 @@ class LatencyTester:
         deadline = time.monotonic() + 3.0
         family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
         target = (self.host, self.port)
-        sock = None
-        try:
-            start = time.monotonic()
-            sock = socket.socket(family, socket.SOCK_STREAM)
-            sock.settimeout(0.4)              # 短超时 + 轮询，便于及时取消
-            while True:
-                if self.cancelled:
-                    return ERR_CANCELLED
-                try:
-                    sock.connect(target)
-                    return (time.monotonic() - start) * 1000
-                except socket.timeout:
-                    if time.monotonic() >= deadline:
-                        return ERR_TIMEOUT
-                    continue
-        except ConnectionRefusedError:
-            return ERR_REFUSED
-        except socket.gaierror:
-            return ERR_UNREACHABLE
-        except OSError as e:
-            return ERR_UNREACHABLE if getattr(e, "errno", None) in (10051, 101, 113) else ERR_FAILED
-        except Exception:
-            return ERR_FAILED
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+        start = time.monotonic()
+        while True:
+            if self.cancelled:
+                return ERR_CANCELLED
+            # 每次尝试都用新 socket：连接超时后原 socket 已不可用，
+            # 复用它再 connect 在 Windows 上会直接报 WSAEINVAL(10022)，
+            # 导致轮询退化成「首次超时就判失败」。
+            sock = None
+            try:
+                sock = socket.socket(family, socket.SOCK_STREAM)
+                sock.settimeout(0.4)          # 短超时 + 轮询，便于及时取消
+                sock.connect(target)
+                return (time.monotonic() - start) * 1000
+            except socket.timeout:
+                if time.monotonic() >= deadline:
+                    return ERR_TIMEOUT
+            except ConnectionRefusedError:
+                return ERR_REFUSED
+            except socket.gaierror:
+                return ERR_UNREACHABLE
+            except OSError as e:
+                return ERR_UNREACHABLE if getattr(e, "errno", None) in (10051, 101, 113) else ERR_FAILED
+            except Exception:
+                return ERR_FAILED
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
 
     # ── 出口延迟 + 归属地 ──
 
