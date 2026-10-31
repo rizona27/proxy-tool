@@ -4,18 +4,32 @@
 体积优化策略：
   1. 排除 Qt / numpy / PIL / 科学计算等全部未使用的大体积第三方模块
   2. 只保留 tkinter + 本项目源码所需的标准库
-  3. UPX 压缩二进制（需 upx.exe 在同目录）
-  4. 单文件模式，无控制台窗口
+  3. **不使用 UPX**（见下方「杀软误报」说明）
+  4. 无控制台窗口
 
-注意：
-  不要排除项目实际用到的标准库（json / urllib.request / traceback /
-  ipaddress / winreg / queue / socket / threading / subprocess / re 等），
-  否则打包后运行时会直接 ImportError。
+── 杀软误报（Behavior:Win32/Impact.A!ml）说明 ──
+  本程序会改写系统代理（HKCU\\...\\Internet Settings）+ 通知 WinInet 刷新，
+  行为序列与「流量劫持木马」高度重合；再叠加下面两个特征就很容易被 ML 判定：
+    · UPX 压缩     —— 恶意软件最常用的加壳方式，静态启发式直接加权
+    · onefile 自解压 —— 启动时把自己解压到 %TEMP%\\_MEIxxxxx 再从那里执行，
+                        等于「临时目录里跑起来一个陌生可执行文件」
+  所以这里改为：
+    · upx=False            —— 放弃那点体积，换干净的节表
+    · 支持 onedir 模式     —— 设环境变量 PT_ONEDIR=1 即产出目录式，
+                              不在临时目录自解压，误报率明显更低
+  仍被拦截时，按此顺序处理：
+    1) 用 PT_ONEDIR=1 重打包
+    2) 给 exe 加数字签名（唯一能根治的办法）
+    3) 向微软提交误报：https://www.microsoft.com/en-us/wdsi/filesubmission
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
+
+# ── 分发形态：默认单文件；PT_ONEDIR=1 时产出目录式 dist\ProxyTool\ ──
+ONEDIR = os.environ.get("PT_ONEDIR", "0").strip().lower() not in (
+    "", "0", "false", "no")
 
 # ── 版本号：从唯一的 version.py 读取，改那一处即可 ──
 try:
@@ -115,18 +129,12 @@ try:
 except Exception:                                # pragma: no cover
     version_info = None
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    [],
+_exe_common = dict(
     name="ProxyTool",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,                     # ← 关键：禁用 UPX 压缩，降低启发式加权
     upx_exclude=["vcruntime140.dll", "python3*.dll"],
     runtime_tmpdir=None,
     console=False,                 # 无控制台窗口
@@ -139,3 +147,18 @@ exe = EXE(
     # ── 版本资源：exe 属性页里显示的版本号，来自 version.py ──
     version=version_info,
 )
+
+if ONEDIR:
+    # 目录式：exe 不内置归档，依赖放同级目录，启动时不在 %TEMP% 解压
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, **_exe_common)
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="ProxyTool",
+    )
+else:
+    exe = EXE(pyz, a.scripts, a.binaries, a.zipfiles, a.datas, **_exe_common)

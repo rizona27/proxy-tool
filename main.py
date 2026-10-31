@@ -85,11 +85,15 @@ def main():
             title="缺少依赖", kind="warn")
         return 1
 
-    # Windows 需要管理员权限才能可靠刷新 WinInet 代理；macOS 不需要提权
-    if platform_ops.IS_WINDOWS and not platform_ops.is_admin():
-        platform_ops.elevate()
-        return 0
-
+    # ⚠️ 不要在这里「不是管理员就自我提权」。
+    #
+    # 本工具只写 HKCU\...\Internet Settings —— 这是当前用户的注册表分支，
+    # 普通权限就能写；InternetSetOptionW(REFRESH) 也只作用于本用户上下文。
+    # 之前启动即 ShellExecuteW("runas") 拉一份自己，在杀软眼里等于：
+    #   未签名自解压程序 → 从 %TEMP% spawn 子进程 → 请求 UAC →
+    #   改写代理注册表 → 删除 PAC
+    # 这是流量劫持木马的标准动作序列，Defender 的 Behavior:Win32/Impact!ml
+    # 就是这么命中的。提权带来零收益，只增加误报面和 UAC 弹窗。
     instance = platform_ops.SingleInstance(APP_NAME)
     if not instance.acquire():
         platform_ops.message_box(

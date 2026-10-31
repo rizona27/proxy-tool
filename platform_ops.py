@@ -478,10 +478,11 @@ def find_resource(names: tuple[str, ...] | list[str]) -> str:
 
 
 def is_admin() -> bool:
-    """是否具备修改系统代理所需的权限。
+    """当前进程是否具备管理员权限。
 
-    macOS 改 networksetup 不需要 root（当前用户即可），故恒 True；
-    Windows 需要管理员才能可靠刷新 WinInet。
+    ⚠️ 本工具**不再**要求管理员：代理设置在 HKCU，普通用户可写可刷新。
+    这个函数只作为诊断用（例如界面上提示「当前以管理员运行」），
+    不要再用它去决定是否提权重启 —— 未签名程序自我提权是杀软的重点特征。
     """
     if IS_MACOS:
         return True
@@ -495,7 +496,12 @@ def is_admin() -> bool:
 
 
 def elevate() -> None:
-    """以管理员权限重启自己（仅 Windows 有意义）"""
+    """以管理员权限重启自己（仅 Windows 有意义）。
+
+    ⚠️ 已从启动流程中移除：改 HKCU 代理不需要管理员。
+    保留此函数仅供将来确实需要写 HKLM 的功能手动调用；
+    不要在 __main__ 里无条件调用它。
+    """
     if not IS_WINDOWS:
         return
     import ctypes
@@ -522,8 +528,11 @@ class SingleInstance:
             import ctypes
             ERROR_ALREADY_EXISTS = 183
             kernel32 = ctypes.windll.kernel32
+            # 用 Local\ 而不是 Global\：Global 命名空间是跨会话/服务可见的，
+            # 属于恶意软件的常见特征（互斥体劫持、防多开），杀软启发式会关注。
+            # 本工具只需要「同一登录会话内单实例」，Local\ 完全够用。
             self._handle = kernel32.CreateMutexW(
-                None, False, f"Global\\{self._name}_SingleInstance")
+                None, False, f"Local\\{self._name}_SingleInstance")
             if not self._handle:
                 return True
             if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:

@@ -242,13 +242,14 @@ macOS   : ~/Library/Logs/ProxyTool/error.log
   - macOS：`networksetup -setwebproxy/-setsecurewebproxy/-setproxybypassdomains`
 - **归属地**：ip-api.com 免费 API（urllib 异步线程）
 - **延迟**：TCP socket（短超时轮询）+ urllib HTTP 往返测时
-- **打包**：PyInstaller（Windows 版 UPX 压缩；macOS 版不打 UPX，避免签名/加载问题）
+- **打包**：PyInstaller。两端**均不打 UPX**（UPX 是杀软误报的头号诱因）；
+  Windows 默认单文件，设 `PT_ONEDIR=1` 可产出目录式分发
 
 ## 模块结构
 
 ```
 proxy-tool/
-├── main.py                 # 入口 + 提权(仅Win) + 单实例 + 全局异常钩子
+├── main.py                 # 入口 + 单实例 + 全局异常钩子
 ├── version.py              # ★ 版本号唯一定义处（改这里即全局生效）
 ├── platform_ops.py         # ★ 跨平台系统层（注册表 / networksetup / 弹窗 / 单实例）
 ├── main_window.py          # 主窗口 UI 与业务逻辑 + Readme 弹窗
@@ -285,7 +286,36 @@ win32com/pywin32/pystray ...
 `Failed to obtain/convert traceback!`。
 PyInstaller 本身只会打包被真实引用的模块，保留标准库几乎不增加体积。
 
-配合 `upx=True` 压缩，最终单文件约 **12 MB**（原 PyQt5 版约 39 MB，↓69%）。
+不再使用 UPX 压缩（`upx=False`），单文件约 **13 MB**（原 PyQt5 版约 39 MB，↓67%）。
+体积的这点差异远不如「不被杀软拦」重要，原因见下一节。
+
+## 杀软误报（Defender 报 `Behavior:Win32/Impact.A!ml`）
+
+本程序的核心动作是**改写系统代理**——写 `HKCU\...\Internet Settings` 下的
+`ProxyEnable` / `ProxyServer` / `ProxyOverride`，必要时删除 `AutoConfigURL`，
+再 `InternetSetOption(REFRESH)` 通知系统。
+
+这串动作与「流量劫持木马」完全一致，差别只在动机，而 ML 分类器看不到动机。
+以下几项叠加会把误报概率推到很高，现已全部处理：
+
+| 诱因 | 说明 | 处理 |
+|------|------|------|
+| **启动即自我提权** | 非管理员就 `ShellExecuteW("runas")` 重启自己 → 未签名程序请求 UAC | **已移除**。改 `HKCU` 和刷新 WinInet 都不需要管理员，提权零收益 |
+| **UPX 压缩** | 恶意软件最常用的加壳方式，静态启发式直接加权 | 已改 `upx=False`，`upx.exe` 不再参与打包 |
+| **onefile 自解压** | 启动时解压到 `%TEMP%\_MEIxxxxx` 再从那里执行 = 「临时目录里跑陌生 exe」 | 支持 `PT_ONEDIR=1` 产出目录式分发 |
+| **`Global\` 互斥体** | 跨会话可见的命名内核对象，恶意软件常用 | 改用 `Local\`，单实例依然生效 |
+| **无数字签名** | 未知发布者 + 行为可疑 | 需自行购买代码签名证书（见下） |
+
+仍被拦截时的处理顺序：
+
+1. **换目录式打包**：`set PT_ONEDIR=1 && build_windows.bat`，产出 `dist\ProxyTool\`
+2. **加数字签名**（唯一根治手段）：OV/EV 代码签名证书，用 `signtool sign /fd sha256 /tr <时间戳URL> /td sha256 ProxyTool.exe`。
+   EV 证书能立刻获得 SmartScreen 信誉；OV 证书需要累积下载量
+3. **提交误报**：<https://www.microsoft.com/en-us/wdsi/filesubmission>
+   选「Software developer」，上传 exe 并说明「本程序按微软文档的方式修改
+   HKCU Internet Settings 以切换 HTTP 代理」。这类 `!ml` 行为判定通常
+   24–72 小时内会更新特征库
+4. 临时自救：用户在 Defender 里对该文件「允许在设备上」，或把所在目录加入排除项
 
 ## 反馈
 
