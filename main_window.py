@@ -47,6 +47,9 @@ _SECTION_BG = "#f1eee8"
 # 默认（全折叠）约 305px；最长的「地址输入」展开约 523px，会被压到 420px 滚动。
 _README_MAX_H = 420
 
+# 代理启用期间的测速间隔（毫秒）：周期性重测「到代理 / 到出口」延迟
+_POLL_INTERVAL_MS = 5000
+
 
 class ProxyTool:
     def __init__(self):
@@ -67,6 +70,10 @@ class ProxyTool:
         self._egress_geo = {}
         self._proxy_geo = {}
         self._tester = None
+        self._poll_job = None          # 周期测速的 after 句柄
+        self._probe_job = None         # 延迟发起的那次测速的 after 句柄
+        self._poll_last_ok = None      # 上轮测速是否成功（用于抑制重复日志）
+        self._probe_seq = 0            # 测速轮次：丢弃已过期的迟到结果
         self._geo_cache = {}
         self._ui_queue = queue.Queue()
         self._flash_job = None
@@ -447,8 +454,16 @@ class ProxyTool:
                 self.port_entry.set(port)
             if host and port and self._tcp_ms is None:
                 self._lookup_geo(host)
-                self.root.after(60, lambda: self._start_probe(host, int(port)))
+                self._schedule_probe(host, int(port), 60)
+            # 启用态下持续周期测速，实时刷新延迟
+            self._start_polling()
         else:
+            self._stop_polling()
+            self._cancel_probe_job()
+            # 作废正在跑的测速：其迟到结果不应再刷到已禁用的界面
+            self._probe_seq += 1
+            if self._tester and self._tester.is_alive():
+                self._tester.cancel()
             self._proxy_host, self._proxy_port = "", ""
             self.toggle_btn.set_text("启用代理")
             self.toggle_btn.set_base_color(PRIMARY)
@@ -738,7 +753,7 @@ class ProxyTool:
                 port_int = None
             if port_int:
                 self._lookup_geo(host)
-                self.root.after(200, lambda: self._start_probe(host, port_int))
+                self._schedule_probe(host, port_int, 200)
         except (PermissionError, OSError) as e:
             self.logger.error(f"启用代理失败 {host}:{port} — {type(e).__name__}: {e}")
             messagebox.showerror("错误", f"注册表写入失败：{e}", parent=self.root)
@@ -782,18 +797,75 @@ class ProxyTool:
     #  延迟 / 归属地检测
     # ═══════════════════════════════════════════
 
-    def _start_probe(self, host, port):
+    def _start_probe(self, host, port, quiet: bool = False):
+        """发起一次延迟检测（到代理的 TCP + 到出口的 HTTP）。
+
+        quiet=True 用于周期测速：不把数值清成「检测中…」，保留上一次
+        的结果原地刷新，避免每 5 秒闪一下。
+        """
         if self._tester and self._tester.is_alive():
             self._tester.cancel()
-        self._tcp_ms = self._egress_ms = None
-        self._egress_geo = {}
-        self.lat_tcp_label.configure(text="到代理: 检测中…", fg=MUTED)
-        self.lat_egress_label.configure(text="出口: 检测中…", fg=MUTED)
+        if not quiet:
+            self._tcp_ms = self._egress_ms = None
+            self._egress_geo = {}
+            self.lat_tcp_label.configure(text="到代理: 检测中…", fg=MUTED)
+            self.lat_egress_label.configure(text="出口: 检测中…", fg=MUTED)
 
         self._tester = LatencyTester(host, port, "HTTP", timeout=5.0)
+        self._probe_seq += 1
+        seq = self._probe_seq
         self._tester.start(
             on_result=lambda tcp, eg, geo, err: self._ui_queue.put(
-                ("latency", tcp, eg, geo, err)))
+                ("latency", tcp, eg, geo, err, quiet, seq)))
+
+    def _schedule_probe(self, host, port, delay_ms: int):
+        """延迟发起一次测速（等注册表/窗口状态稳定后再测）"""
+        self._cancel_probe_job()
+        self._probe_job = self.root.after(
+            delay_ms, lambda: self._delayed_probe(host, port))
+
+    def _delayed_probe(self, host, port):
+        self._probe_job = None
+        if not self._enabled:
+            return                        # 期间已禁用：这次迟到的测速不再发起
+        self._start_probe(host, port)
+
+    def _cancel_probe_job(self):
+        if self._probe_job is not None:
+            try:
+                self.root.after_cancel(self._probe_job)
+            except Exception:
+                pass
+            self._probe_job = None
+
+    def _start_polling(self):
+        """代理启用期间启动周期测速；重复调用不会叠加定时器"""
+        if self._poll_job is not None or not self._enabled:
+            return
+        self._poll_job = self.root.after(_POLL_INTERVAL_MS, self._poll_tick)
+
+    def _stop_polling(self):
+        if self._poll_job is not None:
+            try:
+                self.root.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+
+    def _poll_tick(self):
+        """周期测速：上一轮还没结束就跳过这一拍，避免线程叠加"""
+        self._poll_job = None
+        if not self._enabled:
+            return
+        try:
+            host, port = self._proxy_host, int(self._proxy_port or "")
+        except (TypeError, ValueError):
+            return                        # 地址/端口异常：等下次状态刷新再恢复
+        if not host:
+            return
+        if not (self._tester and self._tester.is_alive()):
+            self._start_probe(host, port, quiet=True)
+        self._poll_job = self.root.after(_POLL_INTERVAL_MS, self._poll_tick)
 
     def _test_connection(self):
         # 代理已启用时不允许再测（按钮本身也是灰的，这里兜底）
@@ -837,13 +909,24 @@ class ProxyTool:
             while True:
                 item = self._ui_queue.get_nowait()
                 if item[0] == "latency":
-                    _, tcp, eg, geo, _err = item
-                    self._tcp_ms, self._egress_ms, self._egress_geo = tcp, eg, geo
+                    _, tcp, eg, geo, _err, quiet, seq = item
+                    if seq != self._probe_seq:
+                        continue              # 已被新一轮测速取代，丢弃
+                    self._tcp_ms, self._egress_ms = tcp, eg
+                    # 周期测速拿不到 geo（限流/失败）时保留上次的归属地
+                    if not quiet or geo:
+                        self._egress_geo = geo
                     self._render_latency()
                     self._render_geo()
-                    self._reset_test_btn()
+                    if not quiet:
+                        self._reset_test_btn()
                     self._update_tray()
-                    self.logger.info(self._latency_log_text(tcp, eg, geo))
+                    # 周期测速每 5 秒一次：只在成功/失败状态翻转时写日志，
+                    # 否则操作日志会被同一行结果刷满
+                    ok = tcp > 0 and eg > 0
+                    if not quiet or ok != self._poll_last_ok:
+                        self.logger.info(self._latency_log_text(tcp, eg, geo))
+                    self._poll_last_ok = ok
                 elif item[0] == "proxy_geo":
                     _, data, err, target = item
                     if data:
@@ -1587,6 +1670,8 @@ class ProxyTool:
             self._quit()
 
     def _quit(self):
+        self._stop_polling()
+        self._cancel_probe_job()
         if self._tester and self._tester.is_alive():
             self._tester.cancel()
         # 退出时也把「成功启用过」的配置留存下来（未启用成功则记录不变）
