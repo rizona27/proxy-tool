@@ -1,4 +1,4 @@
-# 代理切换工具 (Proxy Tool) v1.0.2
+# 代理切换工具 (Proxy Tool) v1.0.3
 
 Windows 平台 HTTP 代理一键切换工具。莫兰迪色系界面，**纯标准库零依赖**，支持系统托盘、归属地查询、双段延迟检测。
 
@@ -30,7 +30,7 @@ Windows 平台 HTTP 代理一键切换工具。莫兰迪色系界面，**纯标�
 
 ## 与初版对比
 
-| 项目 | 初版 (v2.0) | 现在 (v1.0.2) |
+| 项目 | 初版 (v2.0) | 现在 (v1.0.3) |
 |------|------|------|
 | GUI 框架 | PyQt5（第三方） | Tkinter（标准库，**零依赖**） |
 | 打包体积 | ~39 MB | **~12 MB** |
@@ -61,13 +61,19 @@ Windows 平台 HTTP 代理一键切换工具。莫兰迪色系界面，**纯标�
 
 ### 打包版（推荐）
 
-**Windows** —— 在 Windows 上执行：
+**Windows** —— 在 Windows 上执行一键脚本：
 
-```bash
-pyinstaller --clean --noconfirm ProxyTool.spec
+```bat
+build_windows.bat
 ```
 
-产出 `dist/ProxyTool.exe`，双击运行。首次启动请求管理员权限（刷新 WinInet 需要）。
+一次产出两份可执行文件：
+
+- `dist\ProxyTool\ProxyTool.exe` —— **目录式**（推荐分发：exe 不自解压到
+  `%TEMP%`，杀软误报率最低）
+- `dist\ProxyTool.exe` —— **单文件**（便携，误报率略高）
+
+无需管理员权限：代理设置在 `HKCU`，普通用户即可读写并刷新 WinInet。
 
 **macOS** —— 在 macOS 上执行一键脚本：
 
@@ -76,7 +82,7 @@ chmod +x build_macos.sh
 ./build_macos.sh
 ```
 
-产出 `dist/代理切换工具.app` 与 `dist/代理切换工具 v1.0.2.dmg`。
+产出 `dist/代理切换工具.app` 与 `dist/代理切换工具 v1.0.3.dmg`。
 脚本会自动把 `app.ico`/`app.png` 转成 `app.icns`，再打包成 `.app` 并压缩为 `.dmg`。
 
 > ⚠️ **`dmg` 只能在 macOS 上生成**。PyInstaller 不支持跨平台编译，
@@ -142,7 +148,7 @@ python main.py
 │    · 纯 Python 标准库实现…          │
 │    ──────────────────────────────  │
 │                     *rizona.cn@gmail.com* │
-│                           Version 1.0.2 │
+│                           Version 1.0.3 │
 ├────────────────────────────────────┤
 │ Esc 关闭                            │
 └────────────────────────────────────┘
@@ -246,7 +252,7 @@ macOS   : ~/Library/Logs/ProxyTool/error.log
 - **归属地**：ip-api.com 免费 API（urllib 异步线程）
 - **延迟**：TCP socket（短超时轮询）+ urllib HTTP 往返测时
 - **打包**：PyInstaller。两端**均不打 UPX**（UPX 是杀软误报的头号诱因）；
-  Windows 默认单文件，设 `PT_ONEDIR=1` 可产出目录式分发
+  Windows 一次产出「目录式 + 单文件」两份，优先分发目录式
 
 ## 模块结构
 
@@ -292,7 +298,7 @@ PyInstaller 本身只会打包被真实引用的模块，保留标准库几乎�
 不再使用 UPX 压缩（`upx=False`），单文件约 **13 MB**（原 PyQt5 版约 39 MB，↓67%）。
 体积的这点差异远不如「不被杀软拦」重要，原因见下一节。
 
-## 杀软误报（Defender 报 `Behavior:Win32/Impact.A!ml`）
+## 杀软误报（Defender 报 `PUA:AndroidOS/Styricka!MTB` 等）
 
 本程序的核心动作是**改写系统代理**——写 `HKCU\...\Internet Settings` 下的
 `ProxyEnable` / `ProxyServer` / `ProxyOverride`，必要时删除 `AutoConfigURL`，
@@ -301,23 +307,32 @@ PyInstaller 本身只会打包被真实引用的模块，保留标准库几乎�
 这串动作与「流量劫持木马」完全一致，差别只在动机，而 ML 分类器看不到动机。
 以下几项叠加会把误报概率推到很高，现已全部处理：
 
+> 现行产物经字节级扫描：不含 `AndroidManifest` / `classes.dex` / `.apk`
+> 等任何安卓特征（0 命中）。检测名里的 `AndroidOS` 是 Defender ML 模型的
+> 错误归类，属于对 PyInstaller 产物的典型误报，不代表真的夹带安卓恶意代码。
+
 | 诱因 | 说明 | 处理 |
 |------|------|------|
 | **启动即自我提权** | 非管理员就 `ShellExecuteW("runas")` 重启自己 → 未签名程序请求 UAC | **已移除**。改 `HKCU` 和刷新 WinInet 都不需要管理员，提权零收益 |
 | **UPX 压缩** | 恶意软件最常用的加壳方式，静态启发式直接加权 | 已改 `upx=False`，`upx.exe` 不再参与打包 |
-| **onefile 自解压** | 启动时解压到 `%TEMP%\_MEIxxxxx` 再从那里执行 = 「临时目录里跑陌生 exe」 | 支持 `PT_ONEDIR=1` 产出目录式分发 |
+| **onefile 自解压** | 启动时解压到 `%TEMP%\_MEIxxxxx` 再从那里执行 = 「临时目录里跑陌生 exe」 | `build_windows.bat` 同时产出目录式，优先分发 `dist\ProxyTool\` |
 | **`Global\` 互斥体** | 跨会话可见的命名内核对象，恶意软件常用 | 改用 `Local\`，单实例依然生效 |
 | **无数字签名** | 未知发布者 + 行为可疑 | 需自行购买代码签名证书（见下） |
 
 仍被拦截时的处理顺序：
 
-1. **换目录式打包**：`set PT_ONEDIR=1 && build_windows.bat`，产出 `dist\ProxyTool\`
-2. **加数字签名**（唯一根治手段）：OV/EV 代码签名证书，用 `signtool sign /fd sha256 /tr <时间戳URL> /td sha256 ProxyTool.exe`。
-   EV 证书能立刻获得 SmartScreen 信誉；OV 证书需要累积下载量
+1. **优先分发目录式**：`dist\ProxyTool\`（`build_windows.bat` 已自动产出），
+   不自解压、无高熵附加归档，ML 误报率最低
+2. **加数字签名**（唯一根治手段）：
+   - 证书渠道：微软 **Azure Trusted Signing**（按量计费，需在支持区域完成
+     个人/企业身份验证）；**Certum**（有个人版/开源版，门槛最低）；
+     Sectigo / DigiCert / GlobalSign 的 OV 证书；EV 证书最贵但能立刻获得
+     SmartScreen 信誉，OV 需要累积下载量
+   - 签名命令：`signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 ProxyTool.exe`
 3. **提交误报**：<https://www.microsoft.com/en-us/wdsi/filesubmission>
-   选「Software developer」，上传 exe 并说明「本程序按微软文档的方式修改
-   HKCU Internet Settings 以切换 HTTP 代理」。这类 `!ml` 行为判定通常
-   24–72 小时内会更新特征库
+   选「Software developer」，把**目录式与单文件都上传**，说明「本程序按微软
+   文档的方式修改 HKCU Internet Settings 以切换 HTTP 代理，产物内不含任何
+   安卓组件」。这类 `!ml` / `!MTB` 判定通常 24–72 小时内更新特征库
 4. 临时自救：用户在 Defender 里对该文件「允许在设备上」，或把所在目录加入排除项
 
 ## 反馈
@@ -326,4 +341,4 @@ rizona.cn@gmail.com
 
 ---
 
-**版本**: 1.0.2 | **许可**: MIT
+**版本**: 1.0.3 | **许可**: MIT

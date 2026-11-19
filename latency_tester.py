@@ -10,7 +10,10 @@ import time
 import urllib.error
 import urllib.request
 
-from proxy_core import build_geo_url, parse_geo_response
+from proxy_core import build_geo_url, parse_geo_response, resolve_host
+from version import VERSION
+
+UA = f"ProxyTool/{VERSION}"
 
 # ── 错误码（与 UI 展示共用） ──
 ERR_TIMEOUT = -1.0        # TCP 连接超时
@@ -98,8 +101,10 @@ class LatencyTester:
     def _test_tcp(self) -> float:
         """TCP 连接到代理端口，返回毫秒延迟（负数=失败）"""
         deadline = time.monotonic() + 3.0
-        family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
-        target = (self.host, self.port)
+        # 方括号只属于 URL 写法，socket 不认 "[::1]" 这种主机名
+        host = self.host.strip("[]")
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        target = (host, self.port)
         start = time.monotonic()
         while True:
             if self.cancelled:
@@ -121,7 +126,8 @@ class LatencyTester:
             except socket.gaierror:
                 return ERR_UNREACHABLE
             except OSError as e:
-                return ERR_UNREACHABLE if getattr(e, "errno", None) in (10051, 101, 113) else ERR_FAILED
+                code = getattr(e, "winerror", None) or getattr(e, "errno", None)
+                return ERR_UNREACHABLE if code in (10051, 101, 113) else ERR_FAILED
             except Exception:
                 return ERR_FAILED
             finally:
@@ -135,15 +141,15 @@ class LatencyTester:
 
     def _test_egress(self):
         """通过 HTTP 代理请求 ip-api.com，返回 (latency_ms, geo_dict)"""
-        proxy_host = self.host
-        if ":" in proxy_host and not proxy_host.startswith("["):
+        proxy_host = self.host.strip("[]")
+        if ":" in proxy_host:
             proxy_host = f"[{proxy_host}]"       # IPv6 需方括号
         proxy_url = f"http://{proxy_host}:{self.port}"
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
 
         req = urllib.request.Request(
-            build_geo_url(), headers={"User-Agent": "ProxyTool/3.0"})
+            build_geo_url(), headers={"User-Agent": UA})
         try:
             start = time.monotonic()
             with opener.open(req, timeout=self.timeout) as resp:
@@ -180,34 +186,20 @@ class GeoLookup:
 
     def _run(self, on_result):
         try:
+            # DNS 解析放在工作线程内：调用方通常是 UI 线程，不能被解析阻塞
+            target = resolve_host(self.ip) or self.ip
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             req = urllib.request.Request(
-                build_geo_url(self.ip), headers={"User-Agent": "ProxyTool/3.0"})
+                build_geo_url(target), headers={"User-Agent": UA})
             with opener.open(req, timeout=self.timeout) as resp:
-                on_result(parse_geo_response(resp.read()), "")
+                data = parse_geo_response(resp.read())
+            if data.get("status") == "success":
+                on_result(data, "")
+            else:
+                on_result({}, data.get("message") or "查询失败")
         except (urllib.error.URLError, socket.timeout, OSError) as e:
             on_result({}, f"查询失败: {e}")
         except (json.JSONDecodeError, UnicodeDecodeError):
             on_result({}, "响应解析失败")
         except Exception as e:
             on_result({}, f"查询异常: {e}")
-
-
-class EgressLookup:
-    """查询本机直连出口 IP 归属地，走直连不受系统代理影响"""
-
-    def __init__(self, timeout: float = 5.0):
-        self.timeout = timeout
-
-    def start(self, on_result):
-        threading.Thread(target=self._run, args=(on_result,), daemon=True).start()
-
-    def _run(self, on_result):
-        try:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            req = urllib.request.Request(
-                build_geo_url(), headers={"User-Agent": "ProxyTool/3.0"})
-            with opener.open(req, timeout=self.timeout) as resp:
-                on_result(parse_geo_response(resp.read()), "")
-        except Exception as e:
-            on_result({}, str(e))

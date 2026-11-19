@@ -12,8 +12,6 @@ import socket
 
 import platform_ops as _ops
 
-REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-
 # ── 私有 / 内网地址段 ──
 # 说明：<local> 的准确含义是「不含点号的单标签主机名」(NetBIOS)，
 #      它 **不包含任何 IP 字面量**。所以 127.0.0.1、192.168.x.x 等
@@ -97,15 +95,6 @@ def get_current_proxy():
         return enabled, status, server
     except Exception as e:                       # 任何平台异常都不阻塞 UI
         return False, "未知", f"无法获取 ({e})"
-
-
-def read_proxy_override():
-    """读取当前绕过列表原始值（分号连接），未设置返回 None"""
-    try:
-        bypass = _ops.get_proxy_state().get("bypass") or []
-    except Exception:
-        return None
-    return ";".join(bypass) if bypass else None
 
 
 def read_autoconfig_url():

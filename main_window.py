@@ -24,9 +24,9 @@ from widgets import (
 from proxy_core import (
     get_current_proxy, enable_proxy_registry, disable_proxy_registry,
     refresh_system, parse_proxy_server, snapshot_proxy_settings,
-    has_restorable_snapshot, build_bypass, validate_host, validate_port,
-    validate_host_live, looks_like_ipv4,
-    normalize_host, is_private_ip, resolve_host, read_autoconfig_url,
+    has_restorable_snapshot, build_bypass, validate_port,
+    validate_host_live,
+    normalize_host, is_private_ip, read_autoconfig_url,
 )
 from latency_tester import LatencyTester, GeoLookup, error_text
 
@@ -72,6 +72,11 @@ class ProxyTool:
         self._tester = None
         self._poll_job = None          # 周期测速的 after 句柄
         self._probe_job = None         # 延迟发起的那次测速的 after 句柄
+        self._preview_job = None       # 「测试连接」成功后持续刷新的 after 句柄
+        self._preview_target = None    # 持续刷新指向的 (host, port)
+        self._probe_target = None      # 当前测速实际指向的 (host, port)
+        self._probe_quiet = False      # 当前测速是否为静默的周期刷新
+        self._test_timeout_job = None  # 「检测中」超时兜底复位的 after 句柄
         self._poll_last_ok = None      # 上轮测速是否成功（用于抑制重复日志）
         self._probe_seq = 0            # 测速轮次：丢弃已过期的迟到结果
         self._geo_cache = {}
@@ -79,6 +84,8 @@ class ProxyTool:
         self._flash_job = None
         self._orig_snapshot = None
         self._tray = None
+        self._closing = False
+        self._ellipsis_font = None
 
         self._load_settings()
         self._load_snapshot()
@@ -455,10 +462,15 @@ class ProxyTool:
             if host and port and self._tcp_ms is None:
                 self._lookup_geo(host)
                 self._schedule_probe(host, int(port), 60)
+            # 启用态由周期测速接管：结束「测试连接」的预览刷新与过渡态
+            self._stop_preview_polling()
+            self._cancel_test_timeout()
+            self.test_btn.set_text("测试连接")
             # 启用态下持续周期测速，实时刷新延迟
             self._start_polling()
         else:
             self._stop_polling()
+            self._stop_preview_polling()
             self._cancel_probe_job()
             # 作废正在跑的测速：其迟到结果不应再刷到已禁用的界面
             self._probe_seq += 1
@@ -516,8 +528,12 @@ class ProxyTool:
         if not limit or not text:
             return text
         try:
-            from tkinter import font as tkfont
-            f = tkfont.Font(family=FONT_FAMILY, size=font_size)
+            # 字体对象复用：tkfont.Font 会在 Tcl 里注册命名字体，
+            # 每 5 秒周期刷新都新建一次会持续堆积、无法回收
+            f = self._ellipsis_font
+            if f is None:
+                f = tkfont.Font(family=FONT_FAMILY, size=font_size)
+                self._ellipsis_font = f
             if f.measure(text) <= limit:
                 return text
             ell = "…"
@@ -603,6 +619,9 @@ class ProxyTool:
     # ═══════════════════════════════════════════
 
     def _on_log_toggled(self, checked):
+        if not checked:
+            # 先落日志再关闭开关：set_enabled(False) 之后 info() 会被丢弃
+            self.logger.info("日志记录已关闭")
         self.logger.set_enabled(checked)
         self._save_settings()
         if checked:
@@ -660,6 +679,11 @@ class ProxyTool:
         """
         host_raw = self.host_entry.get()
         port_raw = self.port_entry.get().strip()
+
+        # 输入一旦偏离上次测试的目标，就停掉持续刷新，避免旧地址的结果继续刷屏
+        if self._preview_target is not None:
+            if (normalize_host(host_raw), port_raw) != self._preview_target:
+                self._stop_preview_polling()
 
         # 未启用（可编辑）时才做实时红框提示；启用中锁定态一律正常边框
         editable = not self._enabled
@@ -789,7 +813,27 @@ class ProxyTool:
 
     def _on_bypass_toggled(self, checked):
         # 文字亮/灰由 ToggleSwitch 的 link_label 自动处理，这里只给轻提示
-        self.logger.info(f"绕过本地地址 {'开启' if checked else '关闭'}")
+        # 代理已启用时开关必须立刻生效：否则界面显示「已开启」，实际
+        # ProxyOverride 仍是旧值，要等下次重新启用才变化。
+        if self._enabled and self._proxy_host and self._proxy_port:
+            bypass = (build_bypass(bypass_private_ip=True, extra_hosts=None)
+                      if checked else None)
+            try:
+                enable_proxy_registry(self._proxy_host, self._proxy_port,
+                                      bypass, disable_pac=False)
+                refresh_system()
+            except (PermissionError, OSError) as e:
+                self.logger.error(
+                    f"更新绕过列表失败 — {type(e).__name__}: {e}")
+                messagebox.showerror(
+                    "错误", f"更新绕过列表失败：{e}", parent=self.root)
+                # 回滚开关显示，保持与实际状态一致（notify=False 不递归）
+                self.bypass_switch.set(not checked, notify=False)
+                return
+            self.logger.ok(
+                f"绕过本地地址 {'开启' if checked else '关闭'}（已即时生效）")
+        else:
+            self.logger.info(f"绕过本地地址 {'开启' if checked else '关闭'}")
         self._flash_hint("已开启" if checked else "已关闭", MUTED)
         self._save_settings()
 
@@ -812,6 +856,8 @@ class ProxyTool:
             self.lat_egress_label.configure(text="出口: 检测中…", fg=MUTED)
 
         self._tester = LatencyTester(host, port, "HTTP", timeout=5.0)
+        self._probe_target = (host, str(port))
+        self._probe_quiet = bool(quiet)
         self._probe_seq += 1
         seq = self._probe_seq
         self._tester.start(
@@ -867,6 +913,67 @@ class ProxyTool:
             self._start_probe(host, port, quiet=True)
         self._poll_job = self.root.after(_POLL_INTERVAL_MS, self._poll_tick)
 
+    # ── 「测试连接」成功后的持续刷新（未启用代理时也生效） ──
+
+    def _inputs_match(self, host, port) -> bool:
+        """当前输入框是否仍指向指定地址（用于判断刷新是否还有意义）"""
+        return (self._current_host() == host
+                and self.port_entry.get().strip() == str(port))
+
+    def _start_preview_polling(self, host, port):
+        """测试连接确认「到代理 + 出口」都可用后，按启用态同样的节奏刷新"""
+        self._stop_preview_polling()
+        self._preview_target = (host, str(port))
+        self._preview_job = self.root.after(
+            _POLL_INTERVAL_MS, self._preview_tick)
+
+    def _stop_preview_polling(self):
+        if self._preview_job is not None:
+            try:
+                self.root.after_cancel(self._preview_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._preview_job = None
+        # 停的是预览轮询：作废在途结果，避免旧地址的延迟刷到新输入上
+        if (self._preview_target is not None and self._probe_quiet
+                and self._tester and self._tester.is_alive()):
+            self._tester.cancel()
+            self._probe_seq += 1
+        self._preview_target = None
+
+    def _preview_tick(self):
+        """未启用代理时的周期测速：输入不变就继续，变了/启用了立即停"""
+        self._preview_job = None
+        target = self._preview_target
+        if target is None or self._enabled:
+            self._preview_target = None
+            return
+        if not self._inputs_match(*target):
+            self._stop_preview_polling()
+            return
+        try:
+            port = int(target[1])
+        except (TypeError, ValueError):
+            self._stop_preview_polling()
+            return
+        if not (self._tester and self._tester.is_alive()):
+            self._start_probe(target[0], port, quiet=True)
+        self._preview_job = self.root.after(
+            _POLL_INTERVAL_MS, self._preview_tick)
+
+    def _cancel_test_timeout(self):
+        if self._test_timeout_job is not None:
+            try:
+                self.root.after_cancel(self._test_timeout_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._test_timeout_job = None
+
+    def _on_test_timeout(self):
+        """探测线程异常卡死时的兜底：把「检测中」复位"""
+        self._test_timeout_job = None
+        self._reset_test_btn()
+
     def _test_connection(self):
         # 代理已启用时不允许再测（按钮本身也是灰的，这里兜底）
         if self._enabled:
@@ -875,12 +982,16 @@ class ProxyTool:
         if not parsed:
             return
         host, port = parsed
+        # 新一轮测试接管：先停掉上一轮的持续刷新与兜底定时器
+        self._stop_preview_polling()
+        self._cancel_test_timeout()
         self.logger.info(f"测试连接 {host}:{port}")
         self.test_btn.set_enabled(False)
         self.test_btn.set_text("检测中")
         self._lookup_geo(host)
         self._start_probe(host, int(port))
-        self.root.after(6000, self._reset_test_btn)
+        # TCP 3s + 出口 5s，正常结果 8s 内必回；这里只兜住线程卡死
+        self._test_timeout_job = self.root.after(9000, self._on_test_timeout)
 
     def _reset_test_btn(self):
         """探测结束后恢复按钮：文案复位，可用性交给统一规则决定"""
@@ -888,12 +999,12 @@ class ProxyTool:
         self._sync_test_btn()
 
     def _lookup_geo(self, host):
+        """查询代理归属地：DNS 解析交给工作线程，避免阻塞 UI"""
         if is_private_ip(host):
             self._proxy_geo = {"country": "内网地址", "query": host}
             self._render_geo()
             return
-        resolved = resolve_host(host)
-        target = resolved or host
+        target = host.strip("[]")
         if target in self._geo_cache:
             self._proxy_geo = self._geo_cache[target]
             self._render_geo()
@@ -905,6 +1016,8 @@ class ProxyTool:
 
     def _pump_queue(self):
         """把工作线程结果取回主线程渲染"""
+        if self._closing:
+            return
         try:
             while True:
                 item = self._ui_queue.get_nowait()
@@ -918,12 +1031,20 @@ class ProxyTool:
                         self._egress_geo = geo
                     self._render_latency()
                     self._render_geo()
+                    ok = tcp > 0 and eg > 0
                     if not quiet:
+                        self._cancel_test_timeout()
                         self._reset_test_btn()
+                        # 到代理与出口都通：像启用态一样持续刷新延迟
+                        if (ok and not self._enabled and self._probe_target
+                                and self._inputs_match(*self._probe_target)):
+                            self._start_preview_polling(*self._probe_target)
+                    elif self._preview_target is not None and not ok:
+                        # 预览期间掉线：停止刷新，避免每 5 秒空转
+                        self._stop_preview_polling()
                     self._update_tray()
                     # 周期测速每 5 秒一次：只在成功/失败状态翻转时写日志，
                     # 否则操作日志会被同一行结果刷满
-                    ok = tcp > 0 and eg > 0
                     if not quiet or ok != self._poll_last_ok:
                         self.logger.info(self._latency_log_text(tcp, eg, geo))
                     self._poll_last_ok = ok
@@ -939,9 +1060,20 @@ class ProxyTool:
                         self._proxy_geo = {"country": "查询失败", "city": err}
                         self.logger.warn(f"代理归属地查询失败 {target} — {err}")
                     self._render_geo()
+                elif item[0] == "action":
+                    # 托盘线程投递的 UI 动作：统一回主线程执行（Tk 非线程安全）
+                    try:
+                        item[1]()
+                    except Exception:
+                        self._on_callback_error(*sys.exc_info())
+                    if self._closing:
+                        return
         except queue.Empty:
             pass
-        self.root.after(100, self._pump_queue)
+        try:
+            self.root.after(100, self._pump_queue)
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _latency_log_text(tcp, eg, geo) -> str:
@@ -972,8 +1104,8 @@ class ProxyTool:
                 on_toggle=self._toggle_proxy_from_tray,
                 on_show=self._show_window,
                 on_copy=self._copy_info,
-                on_about=self._show_readme,
-                on_quit=self._quit)
+                on_about=lambda: self._post_action(self._show_readme),
+                on_quit=lambda: self._post_action(self._quit))
             self._tray.start()
         except Exception:
             # 托盘不可用不应阻塞主功能
@@ -1060,10 +1192,17 @@ class ProxyTool:
         except Exception:
             pass
 
+    def _post_action(self, fn):
+        """托盘线程调用：把动作投递回主线程执行（Tk 不是线程安全的）"""
+        self._ui_queue.put(("action", fn))
+
     def _toggle_proxy_from_tray(self):
-        self.root.after(0, self._toggle_proxy)
+        self._post_action(self._toggle_proxy)
 
     def _copy_info(self):
+        self._post_action(self._do_copy_info)
+
+    def _do_copy_info(self):
         lines = [APP_TITLE]
         lines.append(f"状态: 已启用 {self._proxy_host}:{self._proxy_port}"
                      if self._enabled else "状态: 已禁用")
@@ -1073,13 +1212,9 @@ class ProxyTool:
             lines.append(f"出口延迟: {self._egress_ms:.0f}ms")
         if self._egress_geo.get("query"):
             lines.append(f"出口 IP: {self._egress_geo['query']}")
-
-        def do_copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append("\n".join(lines))
-            self._flash_hint("✓ 代理信息已复制", SUCCESS_GREEN)
-
-        self.root.after(0, do_copy)
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self._flash_hint("✓ 代理信息已复制", SUCCESS_GREEN)
 
     # ═══════════════════════════════════════════
     #  Readme / 窗口事件 / 退出
@@ -1653,7 +1788,7 @@ class ProxyTool:
 
 
     def _show_window(self):
-        self.root.after(0, self._do_show_window)
+        self._post_action(self._do_show_window)
 
     def _do_show_window(self):
         self.root.deiconify()
@@ -1670,8 +1805,11 @@ class ProxyTool:
             self._quit()
 
     def _quit(self):
+        self._closing = True
         self._stop_polling()
+        self._stop_preview_polling()
         self._cancel_probe_job()
+        self._cancel_test_timeout()
         if self._tester and self._tester.is_alive():
             self._tester.cancel()
         # 退出时也把「成功启用过」的配置留存下来（未启用成功则记录不变）

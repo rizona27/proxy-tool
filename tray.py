@@ -184,7 +184,9 @@ if IS_WINDOWS:
             wc.style = _CS_DBLCLKS
             wc.lpfnWndProc = ctypes.cast(self._wndproc_ref, ctypes.c_void_p)
             wc.hInstance = hinst
-            wc.hIcon = self._load_icon(hinst)
+            # 只加载一次图标：窗口类与托盘共用同一个 HICON，避免句柄泄漏
+            self._hicon = self._load_icon(hinst)
+            wc.hIcon = self._hicon
             wc.hCursor = self._user32.LoadCursorW(None, ctypes.c_wchar_p(32512))
             wc.hbrBackground = None
             wc.lpszClassName = class_name
@@ -245,8 +247,9 @@ if IS_WINDOWS:
             return nid
 
         def _add_icon(self):
-            hinst = self._kernel32.GetModuleHandleW(None)
-            self._hicon = self._load_icon(hinst)
+            if not self._hicon:
+                hinst = self._kernel32.GetModuleHandleW(None)
+                self._hicon = self._load_icon(hinst)
             nid = self._nid(NIF_MESSAGE | NIF_ICON | NIF_TIP)
             self._shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
 

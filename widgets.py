@@ -669,6 +669,8 @@ class ToggleSwitch(tk.Canvas):
             def step(i):
                 if i > steps:
                     self._pos = target
+                    self._draw_knob(target)
+                    self._anim_id = None      # 动画结束：清空句柄，避免误判「动画中」
                     return
                 t = i / steps
                 eased = 1 - (1 - t) ** 3       # iOS 式减速曲线

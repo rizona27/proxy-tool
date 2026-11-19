@@ -528,6 +528,12 @@ class SingleInstance:
             import ctypes
             ERROR_ALREADY_EXISTS = 183
             kernel32 = ctypes.windll.kernel32
+            # 显式声明原型：默认 restype 是 32 位 int，64 位下会截断句柄
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.CreateMutexW.argtypes = [
+                ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
             # 用 Local\ 而不是 Global\：Global 命名空间是跨会话/服务可见的，
             # 属于恶意软件的常见特征（互斥体劫持、防多开），杀软启发式会关注。
             # 本工具只需要「同一登录会话内单实例」，Local\ 完全够用。

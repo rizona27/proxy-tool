@@ -42,32 +42,36 @@ python -c "import version; print(version.VERSION)" > "%TEMP%\pt_ver.txt" 2>nul
 set /p VERSION=<"%TEMP%\pt_ver.txt"
 del "%TEMP%\pt_ver.txt" 2>nul
 
-echo · PyInstaller --clean 打包 ...
-if defined PT_ONEDIR (
-    echo   分发形态：目录式 ^(dist\ProxyTool\^)  —— 误报率更低
-) else (
-    echo   分发形态：单文件 ^(dist\ProxyTool.exe^)
-    echo   若被 Defender 拦截，试试: set PT_ONEDIR=1 ^&^& build_windows.bat
-)
+REM ── 第一次：目录式（exe 不自解压到 %%TEMP%%，误报率最低）──
+echo · PyInstaller --clean 打包 ^(目录式^) ...
+set "PT_ONEDIR=1"
 python -m PyInstaller --clean --noconfirm ProxyTool.spec
 if errorlevel 1 (
-    echo [X] 打包失败
+    echo [X] 目录式打包失败
+    exit /b 1
+)
+
+REM ── 第二次：单文件（便携分发）──
+echo · PyInstaller --clean 打包 ^(单文件^) ...
+set "PT_ONEDIR="
+python -m PyInstaller --clean --noconfirm ProxyTool.spec
+if errorlevel 1 (
+    echo [X] 单文件打包失败
     exit /b 1
 )
 
 echo.
 echo ══════════════════════════════════════════
-echo  ✓ 打包完成
-if defined PT_ONEDIR (
-    echo   产物: dist\ProxyTool\ProxyTool.exe  ^(v%VERSION%^)
-) else (
-    echo   产物: dist\ProxyTool.exe  ^(v%VERSION%^)
-)
+echo  ✓ 打包完成  ^(v%VERSION%^)
+echo   目录式: dist\ProxyTool\ProxyTool.exe
+echo   单文件: dist\ProxyTool.exe
 echo ══════════════════════════════════════════
-echo  提示：本 exe 未做数字签名，Windows 可能提示
-echo        「未知发布者」或被 Defender 启发式拦截。
-echo        根治办法是加代码签名证书；临时办法是提交误报：
-echo        https://www.microsoft.com/en-us/wdsi/filesubmission
+echo  误报说明：exe 未做数字签名，Defender 可能报
+echo            PUA:AndroidOS/Styricka!MTB 等 ML 误报
+echo            （产物内不含任何 Android/DEX 代码）。
+echo    1) 优先分发目录式 dist\ProxyTool\ —— 不自解压，误报率最低
+echo    2) 根治办法是代码签名证书，见 README「杀软误报」一节
+echo    3) 提交误报: https://www.microsoft.com/en-us/wdsi/filesubmission
 echo ══════════════════════════════════════════
 
 endlocal
